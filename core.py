@@ -83,6 +83,43 @@ def _extreme_quad(hull):
     return np.array([p[np.argmin(sm_)], p[np.argmax(df)], p[np.argmax(sm_)], p[np.argmin(df)]], np.float32)
 
 
+def _refine_quad(pts, quad, tol_frac=0.05):
+    """四邊各自用直線擬合（Huber），再取相鄰兩線交點 → 比凸包角更準、更不歪"""
+    pts = pts.reshape(-1, 2).astype(np.float32)
+    q = quad.astype(np.float32)  # tl,tr,br,bl
+    short = min(np.linalg.norm(q[1] - q[0]), np.linalg.norm(q[3] - q[0]),
+                np.linalg.norm(q[2] - q[1]), np.linalg.norm(q[3] - q[2]))
+    tol = max(2.0, tol_frac * short)
+    lines = []
+    for i in range(4):
+        a, b = q[i], q[(i + 1) % 4]
+        d = b - a
+        L = np.linalg.norm(d)
+        u = d / L
+        nrm = np.array([-u[1], u[0]])
+        rel = pts - a
+        t = rel @ u / L
+        dist = np.abs(rel @ nrm)
+        sel = pts[(dist < tol) & (t > 0.08) & (t < 0.92)]
+        if len(sel) < 8:
+            return quad
+        vx, vy, x0, y0 = cv2.fitLine(sel, cv2.DIST_HUBER, 0, 0.01, 0.01).ravel()
+        lines.append((np.array([x0, y0]), np.array([vx, vy])))
+    out = []
+    for i in range(4):
+        p1, d1 = lines[(i - 1) % 4]
+        p2, d2 = lines[i]
+        A = np.array([d1, -d2]).T
+        if abs(np.linalg.det(A)) < 1e-6:
+            return quad
+        t = np.linalg.solve(A, p2 - p1)
+        out.append(p1 + t[0] * d1)
+    out = np.array(out, np.float32)
+    if np.linalg.norm(out - q, axis=1).max() > 0.2 * short:  # 擬合發散就不用
+        return quad
+    return out
+
+
 def _blue_mask(sm):
     hsv = cv2.cvtColor(sm, cv2.COLOR_RGB2HSV)
     mask = cv2.inRange(hsv, (85, 80, 60), (118, 255, 255))
@@ -123,23 +160,65 @@ def detect_inner(img):
             grp.append(c)
     hull = cv2.convexHull(np.vstack(grp))
     quad = _extreme_quad(hull)
+    quad = _refine_quad(np.vstack([c.reshape(-1, 2) for c in grp]), quad)
     area = cv2.contourArea(quad)
     bad = (len(grp) < 3) or area < 0.05 * sh * sw
     bad = bad or bool(np.any(quad < 2) or np.any(quad[:, 0] > sw - 3) or np.any(quad[:, 1] > sh - 3))
     return order_pts(quad / sc), bool(bad)
 
 
-def warp_inner(img, pts, out_w=2400, aspect=2.87, inner=(0.042, 0.055, 0.107, 0.07)):
-    """把四個內角（岩心槽範圍）映射到輸出圖中的內框位置，
-    內框外側保留藍色箱緣（inner = 左、右、上、下 留邊比例）。"""
+def _warp_to(img, pts, out_w, out_h, inner):
     l, r, t, b = inner
-    out_h = int(out_w / aspect)
     x0, x1 = out_w * l, out_w * (1 - r)
     y0, y1 = out_h * t, out_h * (1 - b)
     dst = np.array([[x0, y0], [x1, y0], [x1, y1], [x0, y1]], np.float32)
     M = cv2.getPerspectiveTransform(order_pts(pts), dst)
     return cv2.warpPerspective(img, M, (out_w, out_h), flags=cv2.INTER_CUBIC,
-                               borderMode=cv2.BORDER_REPLICATE)
+                               borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0))
+
+
+def _crop_to_rim(img, inner, shrink=0.003):
+    """從內框往外，沿連續的藍色箱緣找到箱子的外緣，裁掉外面的土、雜物與多餘邊角"""
+    h, w = img.shape[:2]
+    l, r, t, b = inner
+    hsv = cv2.cvtColor(cv2.resize(img, (w // 2, h // 2)), cv2.COLOR_RGB2HSV)
+    m = cv2.inRange(hsv, (85, 70, 50), (118, 255, 255)) > 0
+    h2, w2 = m.shape
+    x0, x1 = int(w2 * l), int(w2 * (1 - r))
+    y0, y1 = int(h2 * t), int(h2 * (1 - b))
+    colf = m[y0 + (y1 - y0) // 6: y1 - (y1 - y0) // 6, :].mean(axis=0)
+    rowf = m[:, x0 + (x1 - x0) // 6: x1 - (x1 - x0) // 6].mean(axis=0 if False else 1)
+
+    def walk(prof, start, step, limit, thr=0.3):
+        i, n = start, 0
+        while 0 <= i + step < len(prof) and n < limit:
+            if prof[i + step] < thr:
+                break
+            i += step
+            n += 1
+        return i
+
+    capx, capy = int(w2 * 0.045), int(h2 * 0.075)
+    xl = walk(colf, x0, -1, capx)
+    xr = walk(colf, x1, +1, capx)
+    yt = walk(rowf, y0, -1, capy)
+    yb = walk(rowf, y1, +1, capy)
+    sx, sy = int(shrink * w), int(shrink * h)
+    return img[max(0, yt * 2 + sy):min(h, yb * 2 - sy), max(0, xl * 2 + sx):min(w, xr * 2 - sx)]
+
+
+def warp_inner(img, pts, out_w=2400, aspect=3.1, shrink=0.003):
+    """內角 → 拉正（兩段式：第二段在拉正後的圖上重新偵測內角再校一次），
+    最後依藍色箱緣裁到箱子外緣，成果與範例 Word 的整箱圖一致。"""
+    big = (0.07, 0.07, 0.14, 0.14)
+    cw = out_w
+    ch = int(cw / 2.9)
+    w1 = _warp_to(img, pts, cw, ch, big)
+    p2, bad2 = detect_inner(w1)
+    w2 = _warp_to(w1, p2, cw, ch, big) if (p2 is not None and not bad2) else w1
+    crop = _crop_to_rim(w2, big, shrink)
+    oh = int(out_w / aspect)
+    return cv2.resize(crop, (out_w, oh), interpolation=cv2.INTER_AREA)
 
 
 def draw_corners(img, pts, color=(255, 0, 0)):
