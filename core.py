@@ -76,65 +76,70 @@ def _reduce_to_quad(hull):
     return cv2.boxPoints(cv2.minAreaRect(hull)).astype(np.float32)
 
 
-def detect_box(img):
-    """以「藍色岩心箱」本身找四角。
-    箱內岩心不是藍色，所以先把箱子填成實心，再用侵蝕把相鄰的箱子/雜物分開，
-    只取最大的那一個箱子，最後把輪廓縮成 4 個角點。
-    回傳 (pts, touches_border)；找不到回傳 (None, False)"""
+def _extreme_quad(hull):
+    """凸包上最靠近四個角落的點（x+y、x-y 的極值），比多邊形近似更貼近真實角"""
+    p = hull.reshape(-1, 2).astype(np.float32)
+    sm_, df = p.sum(axis=1), p[:, 0] - p[:, 1]
+    return np.array([p[np.argmin(sm_)], p[np.argmax(df)], p[np.argmax(sm_)], p[np.argmin(df)]], np.float32)
+
+
+def _blue_mask(sm):
+    hsv = cv2.cvtColor(sm, cv2.COLOR_RGB2HSV)
+    mask = cv2.inRange(hsv, (85, 80, 60), (118, 255, 255))
+    return cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+
+
+def detect_inner(img):
+    """找「岩心所在的那一格」＝藍色岩心箱內側的四個內角（橘框）。
+    做法：藍色箱壁/隔板會圍出 4 個「洞」（每個洞 = 一條岩心槽），
+    把這幾個洞合起來取外框，再縮成 4 個角。腳、土、旁邊的箱子不會形成這種洞，所以不受影響。
+    回傳 (pts, bad)；bad=True 表示不可靠（請手動點）"""
     h, w = img.shape[:2]
     sc = 1000.0 / max(h, w)
     sm = cv2.resize(img, (int(w * sc), int(h * sc)), interpolation=cv2.INTER_AREA)
     sh, sw = sm.shape[:2]
-    hsv = cv2.cvtColor(sm, cv2.COLOR_RGB2HSV)
-    mask = cv2.inRange(hsv, (85, 80, 60), (118, 255, 255))
     ms = min(sh, sw)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
-    kc = max(3, int(ms * 0.012))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kc, kc)))
-    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    solid = np.zeros_like(mask)
-    cv2.drawContours(solid, cnts, -1, 255, -1)          # 把箱內岩心區填實
-    ke = max(3, int(ms * 0.03))
-    ker = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ke, ke))
-    er = cv2.erode(solid, ker)                            # 分開相鄰箱子
-    n, lab, stats, centroids = cv2.connectedComponentsWithStats(er)
-    if n <= 1:
-        return None, False
-    areas = stats[1:, cv2.CC_STAT_AREA].astype(float)
-    if areas.max() < 0.04 * sh * sw:
-        return None, False
-    # 候選：面積不小的箱子；多個箱子時取最靠近照片中心的（拍攝者對準的那一箱）
-    cand = [k + 1 for k, a in enumerate(areas) if a >= 0.35 * areas.max()]
-    cx0, cy0 = sw / 2, sh / 2
-    i = min(cand, key=lambda k: (centroids[k][0] - cx0) ** 2 + (centroids[k][1] - cy0) ** 2)
-    ker2 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ke * 2 + 1, ke * 2 + 1))
-    comp = cv2.dilate((lab == i).astype(np.uint8) * 255, ker2)  # 還原被侵蝕掉的邊角
-    comp = cv2.bitwise_and(comp, solid)
-    cs, _ = cv2.findContours(comp, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    c = max(cs, key=cv2.contourArea)
-    quad = _reduce_to_quad(cv2.convexHull(c))
-    touches = bool(np.any(quad < 3) or np.any(quad[:, 0] > sw - 4) or np.any(quad[:, 1] > sh - 4))
-    return order_pts(quad / sc), touches
+    mask = _blue_mask(sm)
+    k = max(3, int(ms * 0.006))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
+    cnts, hier = cv2.findContours(mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+    holes = []
+    if hier is not None:
+        for idx, c in enumerate(cnts):
+            if hier[0][idx][3] != -1:  # 有父輪廓 = 洞
+                a = cv2.contourArea(c)
+                if a > 0.004 * sh * sw:
+                    holes.append((a, c))
+    if not holes:
+        return None, True
+    holes.sort(key=lambda t: -t[0])
+    a0, c0 = holes[0]
+    (cx0, cy0), (rw, rh), _ = cv2.minAreaRect(c0)
+    minor = min(rw, rh)
+    grp = [c0]
+    for a, c in holes[1:]:
+        (cx, cy), _, _ = cv2.minAreaRect(c)
+        if a >= 0.25 * a0 and np.hypot(cx - cx0, cy - cy0) < 4.5 * minor:
+            grp.append(c)
+    hull = cv2.convexHull(np.vstack(grp))
+    quad = _extreme_quad(hull)
+    area = cv2.contourArea(quad)
+    bad = (len(grp) < 3) or area < 0.05 * sh * sw
+    bad = bad or bool(np.any(quad < 2) or np.any(quad[:, 0] > sw - 3) or np.any(quad[:, 1] > sh - 3))
+    return order_pts(quad / sc), bool(bad)
 
 
-def warp(img, pts, aspect=None, out_w=2400):
-    """透視校正。aspect = 寬/高；None 則由角點估算"""
-    tl, tr, br, bl = order_pts(pts)
-    if aspect is None:
-        ww = (np.linalg.norm(tr - tl) + np.linalg.norm(br - bl)) / 2
-        hh = (np.linalg.norm(bl - tl) + np.linalg.norm(br - tr)) / 2
-        aspect = ww / hh
+def warp_inner(img, pts, out_w=2400, aspect=2.87, inner=(0.042, 0.055, 0.107, 0.07)):
+    """把四個內角（岩心槽範圍）映射到輸出圖中的內框位置，
+    內框外側保留藍色箱緣（inner = 左、右、上、下 留邊比例）。"""
+    l, r, t, b = inner
     out_h = int(out_w / aspect)
-    dst = np.array([[0, 0], [out_w - 1, 0], [out_w - 1, out_h - 1], [0, out_h - 1]], np.float32)
-    M = cv2.getPerspectiveTransform(np.array([tl, tr, br, bl], np.float32), dst)
-    return cv2.warpPerspective(img, M, (out_w, out_h), flags=cv2.INTER_CUBIC)
-
-
-def trim_box(box_img, left=0.005, right=0.005, top=0.055, bottom=0.055):
-    """裁掉整箱上下多餘的邊（範例 Word 的做法），保留藍色箱緣與 4 列岩心"""
-    h, w = box_img.shape[:2]
-    return Image.fromarray(box_img[int(h * top):int(h * (1 - bottom)),
-                                   int(w * left):int(w * (1 - right))])
+    x0, x1 = out_w * l, out_w * (1 - r)
+    y0, y1 = out_h * t, out_h * (1 - b)
+    dst = np.array([[x0, y0], [x1, y0], [x1, y1], [x0, y1]], np.float32)
+    M = cv2.getPerspectiveTransform(order_pts(pts), dst)
+    return cv2.warpPerspective(img, M, (out_w, out_h), flags=cv2.INTER_CUBIC,
+                               borderMode=cv2.BORDER_REPLICATE)
 
 
 def draw_corners(img, pts, color=(255, 0, 0)):
