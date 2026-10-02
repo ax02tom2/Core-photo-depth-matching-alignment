@@ -5,8 +5,8 @@ import streamlit as st
 from PIL import Image
 from streamlit_image_coordinates import streamlit_image_coordinates
 
-from core import (natural_key, load_image, rotate_extra, detect_box, warp,
-                  trim_box, draw_corners, build_pdf, build_docx)
+from core import (natural_key, load_image, rotate_extra, detect_inner, warp_inner,
+                  draw_corners, build_pdf, build_docx)
 
 st.set_page_config(page_title="岩心照片校正與成果輸出", layout="wide")
 st.title("岩心箱照片：轉橫 → 以岩心箱校正 → 套疊成果（Word / PDF）")
@@ -24,17 +24,17 @@ with st.sidebar:
     portrait_dir = st.radio("直式照片（90°拍攝）轉橫的方向", ["逆時針", "順時針"], horizontal=True)
     st.caption("轉橫後標籤 H25-1B 應在箱子上緣右側、箱號 1–4 在右邊且由上往下。若相反，在下方用「額外旋轉」單張修正。")
     global_rot = st.selectbox("全部照片額外旋轉（逆時針）", [0, 90, 180, 270], index=0)
-    aspect = st.number_input("校正後整箱 寬/高（0 = 由角點估算）", 0.0, 10.0, 2.87, 0.01)
+    aspect = st.number_input("成果圖整箱 寬/高", 1.5, 5.0, 2.87, 0.01)
 
-    st.header("成果裁切")
+    st.header("成果留邊（內框外側保留的藍色箱緣）")
+    c1, c2 = st.columns(2)
+    m_left = c1.slider("左 %", 0.0, 15.0, 4.2, 0.1) / 100
+    m_right = c2.slider("右 %", 0.0, 15.0, 5.5, 0.1) / 100
+    m_top = c1.slider("上 %", 0.0, 25.0, 10.7, 0.1) / 100
+    m_bottom = c2.slider("下 %", 0.0, 25.0, 7.0, 0.1) / 100
     rows_per_box = st.number_input("每箱列數", 1, 10, 4)
     row_m = st.number_input("每列代表深度 (m)", 1, 5, 1)
     per_page = st.number_input("每頁箱號數", 4, 40, 20, 4)
-    c1, c2 = st.columns(2)
-    top = c1.slider("上裁 %", 0.0, 20.0, 5.5, 0.5) / 100
-    bottom = c2.slider("下裁 %", 0.0, 20.0, 5.5, 0.5) / 100
-    left = c1.slider("左裁 %", 0.0, 10.0, 0.5, 0.5) / 100
-    right = c2.slider("右裁 %", 0.0, 10.0, 0.5, 0.5) / 100
     end_mark = st.checkbox("最後加「鑽探結束」", True)
     skip_warp = st.checkbox("照片已是正的，不做透視校正", False)
 
@@ -57,7 +57,7 @@ def _load(name, data, pdir):
 @st.cache_data(show_spinner=False, max_entries=120)
 def _detect(name, data, pdir, rot):
     img = rotate_extra(_load(name, data, pdir), rot)
-    return detect_box(img)
+    return detect_inner(img)
 
 
 def cur_rot(name):
@@ -85,8 +85,8 @@ def box_image(f):
     img = get_img(f)
     if not skip_warp:
         pts, _, _ = get_pts(f)
-        img = warp(img, pts, aspect or None)
-    return trim_box(img, left, right, top, bottom)
+        img = warp_inner(img, pts, aspect=aspect, inner=(m_left, m_right, m_top, m_bottom))
+    return Image.fromarray(img)
 
 
 # ---------------- 1. 逐張檢查 ----------------
@@ -111,18 +111,18 @@ if rot_val != cur_rot(sel.name):
 img = get_img(sel)
 pts, bad, man = get_pts(sel)
 if bad and not man:
-    r2.warning("自動偵測的角點貼近照片邊緣或未找到箱子，請檢查紅框；不準就用下方手動點四角。")
+    r2.warning("自動偵測的內角不可靠（找不到 4 條岩心槽或貼近照片邊緣），請檢查紅框；不準就用下方手動點四角。")
 
 colA, colB = st.columns(2)
 with colA:
-    st.caption("已轉橫的原圖與偵測到的箱子四角（紅框）")
+    st.caption("已轉橫的原圖與偵測到的「岩心所在格」四個內角（紅框）")
     st.image(draw_corners(img, pts), use_container_width=True)
 with colB:
-    st.caption("校正並裁切後（成果用）")
+    st.caption("校正後（成果用，外圈保留藍色箱緣）")
     st.image(box_image(sel), use_container_width=True)
 
-with st.expander("角點不準？手動點選岩心箱四個外角"):
-    st.caption("依序點：左上 → 右上 → 右下 → 左下（只點「這一箱」的外緣，避開下方其他箱子）。")
+with st.expander("角點不準？手動點選岩心槽四個內角"):
+    st.caption("依序點：左上 → 右上 → 右下 → 左下（只點岩心所在那一格的內側四角，即隔板圍出的整片槽區）。")
     scale = 900 / img.shape[1]
     small = np.array(Image.fromarray(img).resize((900, int(img.shape[0] * scale))))
     ck = (sel.name, cur_rot(sel.name))
