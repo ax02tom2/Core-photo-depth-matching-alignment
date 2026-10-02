@@ -1,0 +1,6 @@
+streamlit
+streamlit-image-coordinates
+opencv-python-headless
+numpy
+pillow
+reportlab
