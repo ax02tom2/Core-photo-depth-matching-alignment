@@ -24,14 +24,10 @@ with st.sidebar:
     portrait_dir = st.radio("直式照片（90°拍攝）轉橫的方向", ["逆時針", "順時針"], horizontal=True)
     st.caption("轉橫後標籤 H25-1B 應在箱子上緣右側、箱號 1–4 在右邊且由上往下。若相反，在下方用「額外旋轉」單張修正。")
     global_rot = st.selectbox("全部照片額外旋轉（逆時針）", [0, 90, 180, 270], index=0)
-    aspect = st.number_input("成果圖整箱 寬/高", 1.5, 5.0, 2.87, 0.01)
+    aspect = st.number_input("成果圖整箱 寬/高（範例 Word ≈ 3.1）", 1.5, 5.0, 3.1, 0.01)
 
-    st.header("成果留邊（內框外側保留的藍色箱緣）")
-    c1, c2 = st.columns(2)
-    m_left = c1.slider("左 %", 0.0, 15.0, 4.2, 0.1) / 100
-    m_right = c2.slider("右 %", 0.0, 15.0, 5.5, 0.1) / 100
-    m_top = c1.slider("上 %", 0.0, 25.0, 10.7, 0.1) / 100
-    m_bottom = c2.slider("下 %", 0.0, 25.0, 7.0, 0.1) / 100
+    st.header("成果裁切")
+    shrink = st.slider("箱子外緣再內縮 %", 0.0, 3.0, 0.3, 0.1) / 100
     rows_per_box = st.number_input("每箱列數", 1, 10, 4)
     row_m = st.number_input("每列代表深度 (m)", 1, 5, 1)
     per_page = st.number_input("每頁箱號數", 4, 40, 20, 4)
@@ -85,7 +81,7 @@ def box_image(f):
     img = get_img(f)
     if not skip_warp:
         pts, _, _ = get_pts(f)
-        img = warp_inner(img, pts, aspect=aspect, inner=(m_left, m_right, m_top, m_bottom))
+        img = warp_inner(img, pts, aspect=aspect, shrink=shrink)
     return Image.fromarray(img)
 
 
@@ -118,7 +114,7 @@ with colA:
     st.caption("已轉橫的原圖與偵測到的「岩心所在格」四個內角（紅框）")
     st.image(draw_corners(img, pts), use_container_width=True)
 with colB:
-    st.caption("校正後（成果用，外圈保留藍色箱緣）")
+    st.caption("校正後（成果用，已裁到箱子外緣）")
     st.image(box_image(sel), use_container_width=True)
 
 with st.expander("角點不準？手動點選岩心槽四個內角"):
