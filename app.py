@@ -13,7 +13,7 @@ import streamlit.components.v1 as components
 
 import core
 
-APP_VERSION = "2.8"
+APP_VERSION = "2.9"
 DETECTOR_VERSION = getattr(core, "DETECTOR_VERSION", "unknown")
 
 natural_key = core.natural_key
@@ -29,8 +29,40 @@ build_docx = core.build_docx
 _COMPONENT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "point_editor")
 point_editor = components.declare_component("point_editor", path=_COMPONENT_DIR)
 
-st.set_page_config(page_title="岩心照片校正與成果輸出", layout="wide")
+st.set_page_config(page_title="岩心照片校正與成果輸出", layout="wide", initial_sidebar_state="expanded")
+
+# ---------------- 視覺樣式 ----------------
+st.markdown("""
+<style>
+:root{--navy:#17324d;--blue:#0b6fb3;--blue2:#eaf4fb;--teal:#0f7c7c;--teal2:#eaf8f7;--amber:#a96b00;--amber2:#fff7e6;--red:#b42318;--red2:#fff0ee;--line:#d8e1ea;--bg:#f4f7fa;}
+[data-testid="stAppViewContainer"]{background:linear-gradient(180deg,#f7f9fb 0%,#eef3f7 100%);}
+[data-testid="stHeader"]{background:rgba(255,255,255,.75);}
+[data-testid="stSidebar"]{background:linear-gradient(180deg,#f6f9fc 0%,#edf3f8 100%);border-right:1px solid var(--line);}
+.block-container{padding-top:1.1rem;padding-bottom:2rem;max-width:1500px;}
+h1{color:var(--navy);letter-spacing:.02em;}
+.section-card{border:1px solid var(--line);border-radius:14px;padding:13px 16px;margin:4px 0 12px 0;background:white;box-shadow:0 4px 14px rgba(26,51,77,.06);}
+.section-card.blue{background:linear-gradient(135deg,#eaf4fb 0%,#f7fbff 100%);border-color:#a8cbe5;}
+.section-card.teal{background:linear-gradient(135deg,#eaf8f7 0%,#f7fcfc 100%);border-color:#a6d8d5;}
+.section-card.amber{background:linear-gradient(135deg,#fff7e6 0%,#fffdf8 100%);border-color:#ecd49d;}
+.section-title{font-size:1.05rem;font-weight:800;color:var(--navy);margin:0 0 3px 0;}
+.section-sub{font-size:.88rem;color:#506273;margin:0;}
+.hero-preview{border:2px solid #0b6fb3;border-radius:16px;padding:14px 16px 12px 16px;background:linear-gradient(145deg,#eaf4fb 0%,#ffffff 58%,#f6fbff 100%);box-shadow:0 8px 24px rgba(11,111,179,.14);}
+.hero-preview .hero-title{font-size:1.28rem;font-weight:900;color:#0b5488;margin:0 0 2px 0;}
+.hero-preview .hero-sub{font-size:.9rem;color:#486276;margin:0 0 8px 0;}
+.action-card{border:2px solid #0f7c7c;border-radius:14px;padding:11px 14px;background:linear-gradient(135deg,#eaf8f7 0%,#ffffff 100%);box-shadow:0 6px 18px rgba(15,124,124,.10);margin:8px 0 10px 0;}
+.action-card .action-title{font-size:1.02rem;font-weight:900;color:#0f6565;margin:0 0 2px 0;}
+.action-card .action-sub{font-size:.87rem;color:#4a6464;margin:0;}
+.notice-card{border-left:5px solid #d97706;border-radius:10px;padding:9px 12px;background:var(--amber2);color:#7a4b00;margin:8px 0 14px 0;font-weight:700;}
+.status-ok{border-left:5px solid #15803d;border-radius:10px;padding:8px 12px;background:#ecfdf3;color:#166534;font-weight:700;}
+.status-warn{border-left:5px solid #d97706;border-radius:10px;padding:8px 12px;background:#fff7ed;color:#9a3412;font-weight:700;}
+.status-bad{border-left:5px solid #b42318;border-radius:10px;padding:8px 12px;background:#fff0ee;color:#9f1d1a;font-weight:700;}
+.small-note{font-size:.82rem;color:#657789;}
+button[kind="primary"]{min-height:46px;font-size:1.05rem;font-weight:800;box-shadow:0 5px 16px rgba(11,111,179,.18);}
+[data-testid="stMetric"]{background:rgba(255,255,255,.78);border:1px solid var(--line);border-radius:12px;padding:8px 10px;}
+</style>
+""", unsafe_allow_html=True)
 st.title("岩心箱照片校正與成果輸出")
+st.markdown('<div class="section-card blue"><div class="section-title">岩心箱照片校正工作區</div><div class="section-sub">先看左側箱框，再以右側「校正後（成果用）」作為最終成果預覽。</div></div>', unsafe_allow_html=True)
 
 
 def _parse_end_depth(text):
@@ -259,8 +291,7 @@ def _draggable_points(img, pts, key):
 
 
 # ---------------- 1. 檢查 ----------------
-st.subheader("1. 照片檢查")
-st.error("⚠ 重要：自動抓角點只供初判。產生成果前，請逐張檢查左側四個角點與右側校正結果。")
+st.markdown('<div class="notice-card">⚠ 重要提醒：自動抓角點只供初判。產生成果前，請先檢查每張照片左側箱框與右側「校正後（成果用）」預覽。</div>', unsafe_allow_html=True)
 
 out_files = output_files_effective()
 status = {}
@@ -303,7 +334,7 @@ ck = (sel.name, cur_rot(sel.name))
 
 cfg = _photo_cfg(sel.name, cur_rot(sel.name))
 with st.container(border=True):
-    st.markdown("#### 本張調整")
+    st.markdown('<div class="section-card teal" style="margin-top:0"><div class="section-title">本張調整</div><div class="section-sub">只會影響目前這一張照片。</div></div>', unsafe_allow_html=True)
     q1, q2, q3, q4 = st.columns(4)
     with q1:
         cfg["mgx"] = st.slider(
@@ -349,9 +380,9 @@ elif pts is not None:
 else:
     st.error("⚠ 自動偵測失敗，請拖曳四個黃色角點")
 
-colA, colB = st.columns(2)
+colA, colB = st.columns([1, 1], gap="large")
 with colA:
-    st.caption("拖曳黃色角點調整箱框")
+    st.markdown('<div class="section-card"><div class="section-title">拖曳黃色角點調整箱框</div><div class="section-sub">調整左側箱框後，右側成果預覽會同步更新。</div></div>', unsafe_allow_html=True)
     if pts is not None:
         edited = _draggable_points(img, pts, key=f"point_editor_{sel.name}_{ck[1]}_{_nonce('edit_nonce', ck)}")
         if edited is not None and np.max(np.abs(edited - np.asarray(pts))) > 0.5:
@@ -361,7 +392,7 @@ with colA:
         st.image(img, use_container_width=True)
 
 with colB:
-    st.caption("校正後（成果用）")
+    st.markdown('<div class="hero-preview"><div class="hero-title">校正後（成果用）</div><div class="hero-sub">這裡就是最後會放進 Word / PDF 的成果樣式。</div></div>', unsafe_allow_html=True)
     if pts is not None:
         try:
             st.image(box_image(sel), use_container_width=True)
@@ -371,7 +402,6 @@ with colB:
     else:
         st.info("沒有可用角點")
 
-st.caption("拖曳黃色角點即可調整箱框；四個角點不需要依順序操作。")
 reset_auto = st.button("恢復本張自動角點", key=f"reset_auto_{sel.name}_{ck[1]}_{_nonce('edit_nonce', ck)}")
 if reset_auto:
     st.session_state["manual"].pop(ck, None)
@@ -388,11 +418,11 @@ if out_files and sel.name == out_files[-1].name:
         st.info(f"最後一箱：自動判定 {last_k} 槽")
 
 # ---------------- 2. 輸出 ----------------
-st.subheader("2. 輸出成果")
+st.markdown('<div class="action-card"><div class="action-title">📄 產生 Word / PDF</div><div class="action-sub">確認每張照片的校正結果後，按下按鈕產生正式成果。</div></div>', unsafe_allow_html=True)
 _total_rows = total_rows_effective()
 out_files = output_files_effective()
 st.write(f"輸出 {len(out_files)} 張照片 / {_total_rows} 個箱號，每頁 {per_page} 個箱號。")
-st.warning("⚠ 產生成果前請逐張檢查；可直接拖曳黃色角點修正。")
+st.markdown('<div class="notice-card">⚠ 產生成果前請先檢查每張照片；需要修正時可直接拖曳黃色角點。</div>', unsafe_allow_html=True)
 extra = max(0, len(files) - len(out_files))
 if extra:
     st.info(f"已自動排除終深後的 {extra} 張照片。")
@@ -457,4 +487,4 @@ if "pdf" in st.session_state:
     else:
         d2.warning("Word 尚未產生")
 
-st.caption(f"程式版本 {APP_VERSION}｜角點偵測 {DETECTOR_VERSION}")
+st.caption(f"程式版本 {APP_VERSION}")
