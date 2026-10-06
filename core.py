@@ -22,7 +22,7 @@ PAGE_MX, PAGE_MY = 2.0, 1.0
 HEADER_W, HEADER_H = 15.4, 3.17
 BOX_W, BOX_H = 15.15, 4.85
 NUM_COL_W = 1.0
-FULL_ASPECT = 3.12
+FULL_ASPECT = 3.12  # 滿箱成果圖寬/高（= BOX_W/BOX_H，範例 Word 的顯示比例）
 
 SERIF_PATHS = [
     "/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc",
@@ -179,37 +179,10 @@ def _detect_holes(img, full_aspect=3.1):
     quad = order_pts(quad)
     quad = _extend_missing(quad, full_aspect)
     
-    # ---------------- 修正重點：嚴格的幾何條件判斷 ----------------
     area = cv2.contourArea(quad)
     bad = area < 0.05 * sh * sw
-    
-    # 判斷長寬比例與變形
-    w1_len = np.linalg.norm(quad[1] - quad[0])
-    w2_len = np.linalg.norm(quad[2] - quad[3])
-    h1_len = np.linalg.norm(quad[3] - quad[0])
-    h2_len = np.linalg.norm(quad[2] - quad[1])
-    avg_w = (w1_len + w2_len) / 2.0
-    avg_h = (h1_len + h2_len) / 2.0
-    
-    if avg_h > 0 and avg_w > 0:
-        # 1. 長寬比限制
-        ratio = avg_w / avg_h
-        if ratio < 2.0 or ratio > 4.2:
-            bad = True
-        # 2. 邊長落差 (梯形變形過大超過 10%)
-        if abs(w1_len - w2_len) > avg_w * 0.10: bad = True
-        if abs(h1_len - h2_len) > avg_h * 0.10: bad = True
-        # 3. 內角角度檢測 (四個角應接近 90 度，若偏移大於 11.5 度即判定異常)
-        for i in range(4):
-            v1 = quad[i] - quad[(i+1)%4]
-            v2 = quad[(i+2)%4] - quad[(i+1)%4]
-            n1, n2 = np.linalg.norm(v1), np.linalg.norm(v2)
-            if n1 > 0 and n2 > 0:
-                cos_theta = abs(np.dot(v1, v2) / (n1 * n2))
-                if cos_theta > 0.20:
-                    bad = True
-
     bad = bad or bool(np.any(quad < 2) or np.any(quad[:, 0] > sw - 3) or np.any(quad[:, 1] > sh - 3))
+    
     return order_pts(quad / sc), bool(bad)
 
 TRAY_INSET = (0.021, 0.022, 0.061, 0.074)  
@@ -322,7 +295,7 @@ def detect_inner(img, full_aspect=3.1, inset_adj=0.0):
     p = cv2.perspectiveTransform(p_w1.reshape(-1, 1, 2), np.linalg.inv(M1)).reshape(-1, 2)
     p = order_pts(p)
 
-    # 進行最終產出框的再次幾何檢驗
+    # ---------------- 修正重點：極度嚴格的幾何異常檢測 ----------------
     w1_len = np.linalg.norm(p[1] - p[0])
     w2_len = np.linalg.norm(p[2] - p[3])
     h1_len = np.linalg.norm(p[3] - p[0])
@@ -330,13 +303,27 @@ def detect_inner(img, full_aspect=3.1, inset_adj=0.0):
     avg_w = (w1_len + w2_len) / 2.0
     avg_h = (h1_len + h2_len) / 2.0
     
+    hh, ww = img.shape[:2]
+    img_area = hh * ww
+    frame_area = avg_w * avg_h
+    
     if avg_h == 0 or avg_w == 0:
         bad = True
     else:
         ratio = avg_w / avg_h
-        if ratio < 2.0 or ratio > 4.2: bad = True
-        if abs(w1_len - w2_len) > avg_w * 0.10: bad = True
-        if abs(h1_len - h2_len) > avg_h * 0.10: bad = True
+        # 1. 嚴格長寬比例檢測 (標準為 3.12，若框到其他區域會變太胖或太扁)
+        if ratio < 2.6 or ratio > 3.6: 
+            bad = True
+        
+        # 2. 面積比例檢測 (紅框佔據整張照片的比例，過大過小皆異常)
+        if frame_area / img_area < 0.35 or frame_area / img_area > 0.95:
+            bad = True
+            
+        # 3. 嚴格梯形變形檢測 (上下、左右邊長落差不得大於 8%)
+        if abs(w1_len - w2_len) > avg_w * 0.08: bad = True
+        if abs(h1_len - h2_len) > avg_h * 0.08: bad = True
+        
+        # 4. 內角角度檢測 (四個角應接近 90 度)
         for i in range(4):
             v1 = p[i] - p[(i+1)%4]
             v2 = p[(i+2)%4] - p[(i+1)%4]
@@ -345,7 +332,6 @@ def detect_inner(img, full_aspect=3.1, inset_adj=0.0):
                 if abs(np.dot(v1, v2) / (n1 * n2)) > 0.20:
                     bad = True
 
-    hh, ww = img.shape[:2]
     bad = bool(bad or np.any(p[:, 0] < 0) or np.any(p[:, 1] < 0)
                or np.any(p[:, 0] > ww - 1) or np.any(p[:, 1] > hh - 1))
                
@@ -414,7 +400,7 @@ def _font(size):
                     continue
     return ImageFont.load_default()
 
-# ---------------- 修正重點：終極防呆機制，避免 Base64 崩毀 ----------------
+# ---------------- 修正重點：完整恢復 Base64 編碼，解決空白表頭 ----------------
 def make_header(hole, depth, date, project, board=None):
     im = None
     if board is not None:
@@ -424,15 +410,8 @@ def make_header(hole, depth, date, project, board=None):
             pass
             
     if im is None:
-        try:
-            # 嘗試使用您的原始 B64 字串，若無法解碼也不會當機
-            im = Image.open(io.BytesIO(base64.b64decode(BOARD_B64))).convert("RGB")
-        except Exception:
-            # 終極防呆：回傳一張空白圖片，確保產生 PDF/Word 流程絕對不會中斷
-            im = Image.new("RGB", (1540, 317), (240, 240, 240))
-            d = ImageDraw.Draw(im)
-            d.text((50, 100), "Missing Header Image. Please upload 'board_up'.", fill=(255, 0, 0))
-            return im
+        # 直接讀取完整的 BOARD_B64
+        im = Image.open(io.BytesIO(base64.b64decode(BOARD_B64))).convert("RGB")
             
     W, H = im.size
     fill = im.getpixel((int(W * 0.30), int(H * 0.64)))
@@ -611,7 +590,7 @@ def build_docx(boxes, hole, date, project, start_depth=0, rows_per_box=4,
     doc.save(out)
     return out.getvalue()
 
-# (此處為避免再次出錯，我已清空亂碼。請您直接保留您原始專案裡面的這行長字串)
+# 原封不動加回的 Base64 預設表頭照片
 BOARD_B64 = (
     "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAYEBAUEBAYFBQUGBgYHCQ4JCQgICRINDQoOFRIWFhUSFBQXGiEcFxgfGRQUHScdHyIj"
     "JSUlFhwpLCgkKyEkJST/2wBDAQYGBgkICREJCREkGBQYJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk"
