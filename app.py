@@ -13,7 +13,7 @@ import streamlit.components.v1 as components
 
 import core
 
-APP_VERSION = "2.5"
+APP_VERSION = "2.6"
 DETECTOR_VERSION = getattr(core, "DETECTOR_VERSION", "unknown")
 
 natural_key = core.natural_key
@@ -85,12 +85,12 @@ if not files:
 files = sorted(files, key=lambda f: natural_key(f.name))
 for k in ("manual", "rot", "crop_cfg"):
     st.session_state.setdefault(k, {})
-st.session_state.setdefault("state_version", "2.5")
-if st.session_state.get("state_version") != "2.5":
+st.session_state.setdefault("state_version", "2.6")
+if st.session_state.get("state_version") != "2.6":
     st.session_state["manual"].clear()
     st.session_state["rot"].clear()
     st.session_state["crop_cfg"].clear()
-    st.session_state["state_version"] = "2.5"
+    st.session_state["state_version"] = "2.6"
 
 pdir = "ccw" if portrait_dir == "逆時針" else "cw"
 
@@ -148,7 +148,12 @@ def get_pts(f):
     key = (f.name, cur_rot(f.name))
     if key in st.session_state["manual"]:
         return st.session_state["manual"][key], False, True
-    p, bad = _detect(f.name, f.getvalue(), pdir, cur_rot(f.name), DETECTOR_VERSION)
+    try:
+        p, bad = _detect(f.name, f.getvalue(), pdir, cur_rot(f.name), DETECTOR_VERSION)
+    except Exception:
+        # 自動偵測失敗時，不讓整個 Streamlit 頁面中斷。
+        # 直接把本張標成需檢查，讓使用者用拖曳四點修正。
+        return None, True, False
     if p is None:
         return None, True, False
     return p, bool(bad), False
@@ -332,7 +337,7 @@ elif bad:
 elif pts is not None:
     st.success("✓ 自動結果")
 else:
-    st.error("⚠ 找不到四個角點")
+    st.error("⚠ 自動偵測失敗，請拖曳四個黃色角點")
 
 colA, colB = st.columns(2)
 with colA:

@@ -20,7 +20,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 # ---- 版面（依範例 Word 量測：A4、左右 2cm、上下 1cm）----
 PAGE_MX, PAGE_MY = 2.0, 1.0
-DETECTOR_VERSION = "2.5-full-tray"
+DETECTOR_VERSION = "2.6-safe-hough-full-tray"
 HEADER_W, HEADER_H = 15.4, 3.17
 BOX_W, BOX_H = 15.15, 4.85
 NUM_COL_W = 1.0
@@ -437,8 +437,11 @@ def _hough_horizontal_groups(mask):
         return []
 
     raw = []
-    for l in lines[:, 0]:
-        x1, y1, x2, y2 = map(float, l)
+    for l in np.asarray(lines).reshape(-1, 4):
+        vals = np.asarray(l, dtype=np.float32).reshape(-1)
+        if vals.size != 4:
+            continue
+        x1, y1, x2, y2 = map(float, vals.tolist())
         dx, dy = x2 - x1, y2 - y1
         L = float(np.hypot(dx, dy))
         if L < 0.18 * W:
@@ -519,7 +522,12 @@ def _fit_outer_and_inner_blue(img):
     """
     H, W = img.shape[:2]
     mask = _blue_mask_strong(img)
-    groups = _hough_horizontal_groups(mask)
+    try:
+        groups = _hough_horizontal_groups(mask)
+    except (ValueError, TypeError, cv2.error):
+        # 某些 OpenCV/雲端環境對 HoughLinesP 回傳的 ndarray 形狀不同。
+        # 不應讓單張照片把整個 Streamlit 頁面炸掉，改走 fallback。
+        groups = []
     if not groups:
         return None, 0.0
 
