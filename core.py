@@ -40,7 +40,6 @@ def natural_key(s):
 
 # ------------------------------------------------------------------ 影像前處理
 def load_image(file_or_bytes, max_side=3200, portrait_dir="ccw"):
-    """讀圖 → 修正 EXIF → 一律轉成橫式（直式照片依 portrait_dir 轉 90°）"""
     im = Image.open(file_or_bytes)
     im = ImageOps.exif_transpose(im).convert("RGB")
     if max(im.size) > max_side:
@@ -53,18 +52,14 @@ def load_image(file_or_bytes, max_side=3200, portrait_dir="ccw"):
 
 
 def rotate_extra(img, deg):
-    """額外手動旋轉：0 / 90(逆時針) / 180 / 270"""
     return np.ascontiguousarray(np.rot90(img, (deg // 90) % 4))
 
 
 def order_pts(pts):
-    """排序為 左上、右上、右下、左下 (強化大角度傾斜容忍度)"""
     pts = np.array(pts, dtype=np.float32).reshape(4, 2)
-    # 依照 y 座標排序 (分離出上面的點與下面的點)
     y_sorted = pts[np.argsort(pts[:, 1]), :]
     top = y_sorted[:2, :]
     bottom = y_sorted[2:, :]
-    # 分別以 x 座標決定左右
     tl = top[np.argmin(top[:, 0]), :]
     tr = top[np.argmax(top[:, 0]), :]
     bl = bottom[np.argmin(bottom[:, 0]), :]
@@ -84,16 +79,14 @@ def _reduce_to_quad(hull):
 
 
 def _extreme_quad(hull):
-    """凸包上最靠近四個角落的點（x+y、x-y 的極值），比多邊形近似更貼近真實角"""
     p = hull.reshape(-1, 2).astype(np.float32)
     sm_, df = p.sum(axis=1), p[:, 0] - p[:, 1]
     return np.array([p[np.argmin(sm_)], p[np.argmax(df)], p[np.argmax(sm_)], p[np.argmin(df)]], np.float32)
 
 
 def _refine_quad(pts, quad, tol_frac=0.05):
-    """四邊各自用直線擬合（Huber），再取相鄰兩線交點 → 比凸包角更準、更不歪"""
     pts = pts.reshape(-1, 2).astype(np.float32)
-    q = quad.astype(np.float32)  # tl,tr,br,bl
+    q = quad.astype(np.float32)  
     short = min(np.linalg.norm(q[1] - q[0]), np.linalg.norm(q[3] - q[0]),
                 np.linalg.norm(q[2] - q[1]), np.linalg.norm(q[3] - q[2]))
     tol = max(2.0, tol_frac * short)
@@ -122,13 +115,12 @@ def _refine_quad(pts, quad, tol_frac=0.05):
     top_d, bot_d = lines[0][1], lines[2][1]
     top_d = top_d if top_d[0] >= 0 else -top_d
     bot_d = bot_d if bot_d[0] >= 0 else -bot_d
-    base = np.arctan2(top_d[1] + bot_d[1], top_d[0] + bot_d[0])  # 上下邊平均方向
+    base = np.arctan2(top_d[1] + bot_d[1], top_d[0] + bot_d[0]) 
     perp = base + np.pi / 2
     for idx in (1, 3):
         p0, d0 = lines[idx]
         d0 = lr_dir(d0)
         delta = (ang(d0) - perp + np.pi) % (2 * np.pi) - np.pi
-        # 放寬容許歪斜角至 15 度，徹底解決拍攝本身大角度歪斜的問題
         delta = float(np.clip(delta, -np.deg2rad(15.0), np.deg2rad(15.0)))
         a2 = perp + delta
         lines[idx] = (p0, np.array([np.cos(a2), np.sin(a2)]))
@@ -148,8 +140,6 @@ def _refine_quad(pts, quad, tol_frac=0.05):
 
 
 def _extend_missing(quad, full_aspect=3.1, thr=1.25):
-    """整箱 4 槽的內框寬高比約 3.1。若量到的框比這扁很多，代表下面幾槽是空的（藍色槽底
-    不會形成洞，沒被偵測到），依岩心由上往下放的慣例把框往下補足，不要把 2 槽硬拉成 4 槽。"""
     tl, tr, br, bl = quad
     w = (np.linalg.norm(tr - tl) + np.linalg.norm(br - bl)) / 2
     h = (np.linalg.norm(bl - tl) + np.linalg.norm(br - tr)) / 2
@@ -166,7 +156,6 @@ def _blue_mask(sm):
 
 
 def _detect_holes(img, full_aspect=3.1):
-    """找「岩心所在的那一格」＝藍色岩心箱內側的四個內角（橘框）。"""
     h, w = img.shape[:2]
     sc = 1000.0 / max(h, w)
     sm = cv2.resize(img, (int(w * sc), int(h * sc)), interpolation=cv2.INTER_AREA)
@@ -179,7 +168,7 @@ def _detect_holes(img, full_aspect=3.1):
     holes = []
     if hier is not None:
         for idx, c in enumerate(cnts):
-            if hier[0][idx][3] != -1:  # 有父輪廓 = 洞
+            if hier[0][idx][3] != -1: 
                 a = cv2.contourArea(c)
                 if a > 0.004 * sh * sw:
                     holes.append((a, c))
@@ -205,9 +194,8 @@ def _detect_holes(img, full_aspect=3.1):
     return order_pts(quad / sc), bool(bad)
 
 
-# 使用者手點的四個點 = 岩心箱「內側四角」。
-TRAY_INSET = (0.021, 0.022, 0.061, 0.074)  # 左、右、上、下（佔外框寬/高的比例）
-MARGIN = (0.004, 0.006)                    # 成果圖內框外側多留的邊
+TRAY_INSET = (0.021, 0.022, 0.061, 0.074)  
+MARGIN = (0.004, 0.006)                    
 
 
 def _warp_to(img, pts, out_w, out_h, inner):
@@ -221,7 +209,6 @@ def _warp_to(img, pts, out_w, out_h, inner):
 
 
 def _walk_out(line, start, step, cap, gap=6, find=40):
-    """從 start 往外找到第一個藍色，再沿藍色走到箱子外緣"""
     n = len(line)
     i, k = start, 0
     while 0 <= i < n and not line[i] and k < find:
@@ -258,7 +245,6 @@ def _fit_line_robust(pts):
 
 
 def _outer_quad(w, big):
-    """在（已大致拉正的）圖上，沿藍色箱緣找出箱子最外緣四條邊，再取交點。"""
     h, wd = w.shape[:2]
     hsv = cv2.cvtColor(cv2.resize(w, (wd // 2, h // 2)), cv2.COLOR_RGB2HSV)
     m = cv2.inRange(hsv, (85, 70, 50), (118, 255, 255)) > 0
@@ -298,7 +284,6 @@ def _outer_quad(w, big):
 
 
 def detect_inner(img, full_aspect=3.1, inset_adj=0.0):
-    """自動找出「岩心箱內側四角」。加入 inset_adj 使微調生效"""
     ph, bad = _detect_holes(img, full_aspect)
     if ph is None:
         return None, True
@@ -324,7 +309,6 @@ def detect_inner(img, full_aspect=3.1, inset_adj=0.0):
     H = cv2.getPerspectiveTransform(oq, np.float32([[0, 0], [1, 0], [1, 1], [0, 1]]))
     fl, fr, ft, fb = TRAY_INSET
     
-    # 接收 UI 傳來的微調值：正值 = 向外擴大，紅框更往外推不切岩心
     fl = max(0.0, fl - inset_adj)
     fr = max(0.0, fr - inset_adj)
     ft = max(0.0, ft - inset_adj)
@@ -341,7 +325,6 @@ def detect_inner(img, full_aspect=3.1, inset_adj=0.0):
 
 
 def warp_points(img, pts, out_w=2400, aspect=3.12, margin=MARGIN):
-    """把「內側四角」直接拉成長方形"""
     mx, my = margin
     out_h = int(out_w / aspect)
     x0, x1 = out_w * mx, out_w * (1 - mx)
@@ -353,7 +336,6 @@ def warp_points(img, pts, out_w=2400, aspect=3.12, margin=MARGIN):
 
 
 def crop_partial(im, k, n=4, margin=MARGIN):
-    """最後一箱只有 k 列有岩心：保留前 k 槽（含其下方隔板），刪掉後面的空槽"""
     if not k or k >= n:
         return im
     mx, my = margin
@@ -363,10 +345,8 @@ def crop_partial(im, k, n=4, margin=MARGIN):
 
 
 def auto_detect_filled_rows(img, total_rows=4):
-    """自動偵測有岩心的列數 (利用 HSV 判斷大面積藍色空槽)"""
     h, w = img.shape[:2]
-    # 將影像縮小加速分析，並濾除細節雜訊
-    small = cv2.resize(img, (w // 4, h // 4))
+    small = cv2.resize(img, (max(1, w // 4), max(1, h // 4)))
     sh, sw = small.shape[:2]
     s_row_h = sh // total_rows
     hsv = cv2.cvtColor(small, cv2.COLOR_RGB2HSV)
@@ -374,15 +354,12 @@ def auto_detect_filled_rows(img, total_rows=4):
     filled_count = 0
     for i in range(total_rows):
         strip = hsv[i * s_row_h:(i + 1) * s_row_h, :]
-        # 尋找岩心箱底部的藍色範圍 (排除土石顏色)
         blue_mask = cv2.inRange(strip, (85, 50, 50), (125, 255, 255))
         blue_ratio = np.sum(blue_mask > 0) / (strip.shape[0] * strip.shape[1])
         
-        # 藍色區域如果小於 40% (即被灰褐色岩心大量覆蓋)，則視為裝有岩心
         if blue_ratio < 0.40:
             filled_count = i + 1
             
-    # 若照片太暗或泥巴太多導致全空，確保至少回傳 1 列避免系統報錯
     return max(1, filled_count)
 
 
@@ -407,9 +384,13 @@ def _font(size):
                     continue
     return ImageFont.load_default()
 
-
+# 已修正 EOF 崩潰漏洞：直接接收 bytes
 def make_header(hole, depth, date, project, board=None):
-    im = Image.open(board if board else io.BytesIO(base64.b64decode(BOARD_B64))).convert("RGB")
+    if board is not None:
+        im = Image.open(io.BytesIO(board)).convert("RGB")
+    else:
+        im = Image.open(io.BytesIO(base64.b64decode(BOARD_B64))).convert("RGB")
+        
     W, H = im.size
     fill = im.getpixel((int(W * 0.30), int(H * 0.64)))
     d = ImageDraw.Draw(im)
@@ -599,7 +580,7 @@ BOARD_B64 = (
     "JCQkJCQkJCT/wAARCAFIBkADASIAAhEBAxEB/8QAHAAAAQQDAQAAAAAAAAAAAAAAAQACBgcDBAUI/8QAXhAAAQIEAwMFCAgRCwME"
     "AwADAQIDAAQFEQYHIRIxQRNRYXHRFBUWIoGRk9IXMjWSlKGxwSMkJSYzNDZCRVJicnOCg6KyCENEU1RVY3SE4eJGVmSjs8LwGKTx"
     "J2WV/8QAGwEBAQEBAQEBAQAAAAAAAAAAAAECAwQFBgf/xAA4EQACAQIFAgUDAwMEAgIDAAAAAQIDEQQSITFRE1IUMkFhoSIzkQUj"
-    "cYGx8BVCU2IGJMHxNEPh/9oADAMBAAIRAxEAPwCeTr9JpC0zE46wwVqsNNVGA1mJhVCCnvq2CneOTV2RhxDRKZUp5pNUlTMtoIAR"
+    "cYGx8BVCU2IGJMHxNEPh/9oAMBAAIRAxEAPwCeTr9JpC0zE46wwVqsNNVGA1mJhVCCnvq2CneOTV2RhxDRKZUp5pNUlTMtoIAR"
     "tEC54m0bkvl3hRtIU1RZVN+N1a/HHWMYuN5M43ZnbxxQHGwpM8FAi/2NXZD28bUJ1CiidBsbHxFD5oy+B9BCbd7GCBwN+2CnCVCb"
     "QQKXL2JuRY9sVqn7luzWaxtQ3XghM4Su27k1CHO44obNtqbVvto2oxsN4aozQ2UUyWSOPiwFYYojh8alyx57p/3haHuLs13MbUTU"
     "91KH7NUNTjmgqZDiZpezz8kqN4YYoljamS1ubYgqwzRnANumSqutEGqfuLs57OPKAvb2ZtZ2d/0IxiVmNh5LoR3S8VE2ADKjHSbw"
@@ -705,33 +686,4 @@ BOARD_B64 = (
     "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"
-    "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"
 )
