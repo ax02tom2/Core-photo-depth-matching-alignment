@@ -388,82 +388,317 @@ def _inner_quad_from_blue(w1, outer_q, expected=TRAY_INSET):
     return q
 
 
-def detect_inner(img, full_aspect=3.1):
-    """自動找出「岩心箱內側四角」。
 
-    流程：
-    1) 以岩心槽粗略定位箱子；
-    2) 透視拉正後，以藍色箱壁的「內側邊界」直接擬合四條線；
-    3) 四線交點就是內角，再轉回原圖。
+# ------------------------------------------------------------------ 自動箱框 / 內角偵測（v2.2）
+def _blue_mask_strong(img):
+    """較寬容的藍色箱體遮罩；岩心箱的藍色本身就是最穩定的幾何線索。"""
+    hsv = cv2.cvtColor(img, cv2.COLOR_RGB2HSV)
+    m = cv2.inRange(hsv, (78, 55, 40), (128, 255, 255))
+    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+    m = cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    return m
 
-    TRAY_INSET 只作為搜尋範圍，不再直接決定最後角點。
-    若內緣偵測失敗，才退回舊方法，並標記 bad=True。
+
+def _line_intersection(a, da, b, db):
+    A = np.array([da, -db], np.float32).T
+    if abs(float(np.linalg.det(A))) < 1e-6:
+        return None
+    t = np.linalg.solve(A, np.asarray(b, np.float32) - np.asarray(a, np.float32))
+    return np.asarray(a, np.float32) + float(t[0]) * np.asarray(da, np.float32)
+
+
+def _fit_line_loose(points):
+    """允許較少點的 robust fit，專門給歪照片的箱邊。"""
+    pts = np.asarray(points, np.float32).reshape(-1, 2)
+    if len(pts) < 4:
+        return None
+    vx, vy, x0, y0 = cv2.fitLine(pts, cv2.DIST_HUBER, 0, 0.01, 0.01).ravel()
+    return np.array([x0, y0], np.float32), np.array([vx, vy], np.float32)
+
+
+def _hough_horizontal_groups(mask):
+    """找出岩心箱內多條近似平行的藍色橫桿。
+
+    之所以先找「一組橫桿」，是為了把打開的箱蓋排除掉；蓋子通常只有一兩條長線，
+    真正的岩心槽區會有 4~6 條規律的橫向藍線，即使整張照片是歪的也不影響。
     """
-    ph, bad = _detect_holes(img, full_aspect)
-    if ph is None:
-        return None, True
-
-    cw = 2400
-    ch = int(cw / 2.9)
-    big = (0.07, 0.07, 0.14, 0.14)
-    l, r, t, b = big
-    dst = np.array([
-        [cw * l, ch * t],
-        [cw * (1 - r), ch * t],
-        [cw * (1 - r), ch * (1 - b)],
-        [cw * l, ch * (1 - b)]
-    ], np.float32)
-
-    M1 = cv2.getPerspectiveTransform(order_pts(ph), dst)
-    w1 = cv2.warpPerspective(
-        img, M1, (cw, ch), flags=cv2.INTER_LINEAR,
-        borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0)
+    H, W = mask.shape[:2]
+    edge = cv2.Canny(mask, 40, 120)
+    lines = cv2.HoughLinesP(
+        edge,
+        1,
+        np.pi / 180,
+        threshold=max(18, int(0.055 * W)),
+        minLineLength=max(45, int(0.18 * W)),
+        maxLineGap=max(8, int(0.035 * W)),
     )
+    if lines is None:
+        return []
 
-    oq = _outer_quad(w1, big)
-    if oq is None:
-        return ph, True
+    raw = []
+    for l in lines[:, 0]:
+        x1, y1, x2, y2 = map(float, l)
+        dx, dy = x2 - x1, y2 - y1
+        L = float(np.hypot(dx, dy))
+        if L < 0.18 * W:
+            continue
+        ang = np.degrees(np.arctan2(dy, dx))
+        if min(abs(ang), abs(abs(ang) - 180)) > 22:
+            continue
+        slope = dy / (dx + 1e-6)
+        yc = (y1 + y2) * 0.5 + slope * (W * 0.5 - (x1 + x2) * 0.5)
+        raw.append((float(yc), float(slope), L, (x1, y1, x2, y2)))
+    if not raw:
+        return []
 
-    ow = (np.linalg.norm(oq[1] - oq[0]) + np.linalg.norm(oq[2] - oq[3])) / 2
-    oh = (np.linalg.norm(oq[3] - oq[0]) + np.linalg.norm(oq[2] - oq[1])) / 2
-    inner_w = cw * (1 - l - r)
-    inner_h = ch * (1 - t - b)
-    if not (1.0 < ow / inner_w < 1.25 and 1.0 < oh / inner_h < 1.45):
-        return ph, True
+    raw.sort(key=lambda x: x[0])
+    groups = []
+    for item in raw:
+        yc, slope, L, seg = item
+        placed = False
+        for g in groups:
+            slope_diff = abs(np.degrees(np.arctan(slope)) - np.degrees(np.arctan(g["slope"])))
+            if abs(yc - g["y"]) <= max(7.0, 0.018 * H) and slope_diff <= 8.0:
+                g["items"].append(item)
+                g["y"] = float(np.mean([z[0] for z in g["items"]]))
+                g["slope"] = float(np.mean([z[1] for z in g["items"]]))
+                g["length"] += L
+                placed = True
+                break
+        if not placed:
+            groups.append({"y": yc, "slope": slope, "items": [item], "length": L})
 
-    iq = _inner_quad_from_blue(w1, oq, TRAY_INSET)
+    groups.sort(key=lambda g: g["y"])
+    merged = []
+    for g in groups:
+        if merged and abs(g["y"] - merged[-1]["y"]) <= max(9.0, 0.022 * H):
+            merged[-1]["items"] += g["items"]
+            merged[-1]["y"] = float(np.mean([z[0] for z in merged[-1]["items"]]))
+            merged[-1]["length"] += g["length"]
+        else:
+            merged.append(g)
 
-    # 找不到真正內緣時才使用舊的固定比例方法。
-    if iq is None:
-        H = cv2.getPerspectiveTransform(
-            oq, np.float32([[0, 0], [1, 0], [1, 1], [0, 1]])
+    # 選擇一段有 5 條左右橫線的區域；歪斜造成間距不等沒有關係。
+    best = None
+    ys = [g["y"] for g in merged]
+    min_gap = max(7.0, 0.020 * H)
+    max_gap = max(40.0, 0.28 * H)
+    for i in range(len(merged)):
+        for j in range(i + 3, len(merged)):
+            sub = merged[i:j + 1]
+            y = [g["y"] for g in sub]
+            d = np.diff(y)
+            if len(d) < 3:
+                continue
+            if np.any(d < min_gap) or np.any(d > max_gap):
+                continue
+            span = y[-1] - y[0]
+            if not (0.14 * H <= span <= 0.72 * H):
+                continue
+            cv = float(np.std(d) / (np.mean(d) + 1e-6))
+            if cv > 0.90:
+                continue
+            # 5 條以上優先；同樣條數時，較寬、較長、較靠下的組較可信。
+            score = (
+                len(sub) * 2.0
+                + 3.0 * span / H
+                + 0.35 * sum(g["length"] for g in sub) / (W * len(sub))
+                - 1.5 * min(cv, 0.8)
+                + 0.45 * y[0] / H
+            )
+            if best is None or score > best[0]:
+                best = (score, sub)
+    return best[1] if best else []
+
+
+def _fit_outer_and_inner_blue(img):
+    """直接由藍色箱壁找外框與內緣。
+
+    回傳 (inner_quad, quality)。quality 只表示幾何線索是否充分，並不把「歪」當成錯誤。
+    """
+    H, W = img.shape[:2]
+    mask = _blue_mask_strong(img)
+    groups = _hough_horizontal_groups(mask)
+    if not groups:
+        return None, 0.0
+
+    # 最外的兩條藍線當作箱體上下外框。
+    end_lines = []
+    for g in (groups[0], groups[-1]):
+        pts = []
+        for _, _, _, (x1, y1, x2, y2) in g["items"]:
+            pts.extend(((x1, y1), (x2, y2)))
+        end_lines.append(_fit_line_loose(pts))
+    if any(x is None for x in end_lines):
+        return None, 0.0
+
+    def y_at(ln, x):
+        p, d = ln
+        return float(p[1] + d[1] / (d[0] + 1e-6) * (x - p[0]))
+
+    top_ln, bot_ln = end_lines
+    top_yc = y_at(top_ln, W * 0.5)
+    bot_yc = y_at(bot_ln, W * 0.5)
+    if not (0 <= top_yc < bot_yc <= H):
+        return None, 0.0
+
+    # 外框左右邊：在上下外框之間，每列取左右最外側連續藍帶，再做 robust fit。
+    left_pts, right_pts = [], []
+    for y in np.linspace(top_yc + 0.10 * (bot_yc - top_yc),
+                         bot_yc - 0.10 * (bot_yc - top_yc), 180).astype(int):
+        row = mask[y] > 0
+        # 左側只在 0~40% 搜；右側只在 60~100% 搜，避免隔板進來。
+        xs = np.flatnonzero(row[:max(1, int(W * 0.40))])
+        if len(xs):
+            # 取最左側藍帶的最後一點（較接近內緣），外側/內側都可由後續掃描修正。
+            left_pts.append((float(xs[0]), float(y)))
+        xs = np.flatnonzero(row[min(W - 1, int(W * 0.60)):])
+        if len(xs):
+            right_pts.append((float(min(W - 1, int(W * 0.60)) + xs[-1]), float(y)))
+
+    left_ln = _fit_line_loose(left_pts)
+    right_ln = _fit_line_loose(right_pts)
+    if left_ln is None or right_ln is None:
+        return None, 0.0
+
+    outer = []
+    for a, b in ((top_ln, left_ln), (top_ln, right_ln),
+                 (bot_ln, right_ln), (bot_ln, left_ln)):
+        q = _line_intersection(a[0], a[1], b[0], b[1])
+        if q is None:
+            return None, 0.0
+        outer.append(q)
+    outer = order_pts(np.asarray(outer, np.float32))
+
+    # 由外框往內找「第一段藍色帶的最後一點」= 內緣。
+    def last_blue_run(line, start, stop, step, max_gap=4):
+        i = int(round(start))
+        stop = int(round(stop))
+        found = None
+        while 0 <= i < len(line) and ((i <= stop) if step > 0 else (i >= stop)):
+            if line[i]:
+                found = i
+                miss = 0
+                j = i + step
+                while 0 <= j < len(line) and ((j <= stop) if step > 0 else (j >= stop)):
+                    if line[j]:
+                        found = j
+                        miss = 0
+                    else:
+                        miss += 1
+                        if miss >= max_gap:
+                            break
+                    j += step
+                return found
+            i += step
+        return None
+
+    tl, tr, br, bl = outer
+    top_pts, bottom_pts, left_inner_pts, right_inner_pts = [], [], [], []
+    top_outer = lambda x: np.interp(x, [tl[0], tr[0]], [tl[1], tr[1]])
+    bot_outer = lambda x: np.interp(x, [bl[0], br[0]], [bl[1], br[1]])
+    left_outer = lambda y: np.interp(y, [tl[1], bl[1]], [tl[0], bl[0]])
+    right_outer = lambda y: np.interp(y, [tr[1], br[1]], [tr[0], br[0]])
+
+    for x in np.linspace(tl[0] + 0.10 * (tr[0] - tl[0]),
+                         tr[0] - 0.10 * (tr[0] - tl[0]), 180).astype(int):
+        y0 = top_outer(x)
+        y = last_blue_run(mask[:, x] > 0, y0 - 3, min(H - 1, y0 + 0.08 * H), +1)
+        if y is not None:
+            top_pts.append((float(x), float(y)))
+        y1 = bot_outer(x)
+        y = last_blue_run(mask[:, x] > 0, y1 + 3, max(0, y1 - 0.08 * H), -1)
+        if y is not None:
+            bottom_pts.append((float(x), float(y)))
+
+    for y in np.linspace(tl[1] + 0.10 * (bl[1] - tl[1]),
+                         bl[1] - 0.10 * (bl[1] - tl[1]), 180).astype(int):
+        x0 = left_outer(y)
+        x = last_blue_run(mask[y, :] > 0, x0 - 3, min(W - 1, x0 + 0.10 * W), +1)
+        if x is not None:
+            left_inner_pts.append((float(x), float(y)))
+        x1 = right_outer(y)
+        x = last_blue_run(mask[y, :] > 0, x1 + 3, max(0, x1 - 0.10 * W), -1)
+        if x is not None:
+            right_inner_pts.append((float(x), float(y)))
+
+    inner_lines = [
+        _fit_line_loose(top_pts),
+        _fit_line_loose(right_inner_pts),
+        _fit_line_loose(bottom_pts),
+        _fit_line_loose(left_inner_pts),
+    ]
+    counts = np.array([len(top_pts), len(right_inner_pts), len(bottom_pts), len(left_inner_pts)], float)
+    if any(x is None for x in inner_lines):
+        return None, float(np.mean(counts > 20) * 0.55)
+
+    inner = []
+    for i in range(4):
+        q = _line_intersection(
+            inner_lines[(i - 1) % 4][0], inner_lines[(i - 1) % 4][1],
+            inner_lines[i][0], inner_lines[i][1]
         )
-        fl, fr, ft, fb = TRAY_INSET
-        inn = np.float32([
-            [fl, ft], [1 - fr, ft],
-            [1 - fr, 1 - fb], [fl, 1 - fb]
-        ])
-        p_w1 = cv2.perspectiveTransform(
-            inn.reshape(-1, 1, 2), np.linalg.inv(H)
-        ).reshape(-1, 2)
-        p = cv2.perspectiveTransform(
-            p_w1.reshape(-1, 1, 2), np.linalg.inv(M1)
-        ).reshape(-1, 2)
+        if q is None:
+            return None, 0.0
+        inner.append(q)
+    inner = order_pts(np.asarray(inner, np.float32))
+
+    ow = (np.linalg.norm(outer[1] - outer[0]) + np.linalg.norm(outer[2] - outer[3])) / 2
+    oh = (np.linalg.norm(outer[3] - outer[0]) + np.linalg.norm(outer[2] - outer[1])) / 2
+    iw = (np.linalg.norm(inner[1] - inner[0]) + np.linalg.norm(inner[2] - inner[3])) / 2
+    ih = (np.linalg.norm(inner[3] - inner[0]) + np.linalg.norm(inner[2] - inner[1])) / 2
+    if min(ow, oh, iw, ih) <= 0:
+        return None, 0.0
+    ratio_ok = 0.62 < iw / ow < 0.995 and 0.58 < ih / oh < 0.995
+    area = abs(cv2.contourArea(inner))
+    area_ok = area > 0.03 * W * H
+    in_bounds = np.all(inner[:, 0] > -0.08 * W) and np.all(inner[:, 0] < 1.08 * W) and \
+                np.all(inner[:, 1] > -0.08 * H) and np.all(inner[:, 1] < 1.08 * H)
+    support = float(np.mean(np.minimum(counts / 180.0, 1.0)))
+    quality = 0.45 * support + 0.30 * float(ratio_ok) + 0.15 * float(area_ok) + 0.10 * float(in_bounds)
+    if not (ratio_ok and area_ok and in_bounds):
+        return None, quality
+    return inner, quality
+
+
+def _fallback_inner_from_holes(img, full_aspect=3.1):
+    """舊方法作最後備援，但不再把「貼近照片邊緣」直接判成異常。"""
+    p, _ = _detect_holes(img, full_aspect)
+    if p is None:
+        return None
+    q = order_pts(p)
+    # 備援時用很小的外擴，寧可多留藍邊，也不要把岩心切掉。
+    c = q.mean(axis=0)
+    return c + (q - c) * 1.008
+
+
+def detect_inner(img, full_aspect=3.1):
+    """自動抓岩心箱內四角。
+
+    重點：歪斜是正常情況，不會因為斜就標成異常；只有幾何線索不足才要求檢查。
+    """
+    h, w = img.shape[:2]
+    # 先縮小再做 Hough，速度更穩定；最後角點再放回原圖座標。
+    sc = min(1.0, 1400.0 / max(h, w))
+    work = cv2.resize(img, (int(w * sc), int(h * sc)), interpolation=cv2.INTER_AREA) if sc < 0.999 else img
+    p, quality = _fit_outer_and_inner_blue(work)
+    if p is not None:
+        if sc < 0.999:
+            p = p / sc
+        return order_pts(p), bool(quality < 0.28)
+
+    # 備援：原有槽洞法通常能處理標準角度照片。
+    p = _fallback_inner_from_holes(work, full_aspect)
+    if p is not None:
+        if sc < 0.999:
+            p = p / sc
+        # 有效四邊形就先視為自動成功；不要再用「靠近邊界」把正常照片判異常。
         p = order_pts(p)
-        return p, True
+        area = abs(cv2.contourArea(p.astype(np.float32)))
+        geom_ok = area > 0.02 * w * h and np.all(np.isfinite(p))
+        return p, not geom_ok
 
-    p = cv2.perspectiveTransform(
-        iq.reshape(-1, 1, 2), np.linalg.inv(M1)
-    ).reshape(-1, 2)
-    p = order_pts(p)
-
-    hh, ww = img.shape[:2]
-    bad = bool(
-        bad or np.any(p[:, 0] < 0) or np.any(p[:, 1] < 0) or
-        np.any(p[:, 0] > ww - 1) or np.any(p[:, 1] > hh - 1)
-    )
-    return p, bad
-
+    return None, True
 
 def _expand_source_quad(pts, pad=0.006):
     """把來源四角向箱外微擴，避免內角剛好壓在岩心上造成切心。
@@ -490,58 +725,66 @@ def warp_points(img, pts, out_w=2400, aspect=3.12, margin=MARGIN, source_pad=0.0
                                borderMode=cv2.BORDER_REPLICATE)
 
 
-def detect_occupied_rows(im, n=4):
-    """自動判斷最後一箱實際有幾列岩心。
 
-    以每槽的「非藍色比例 + 灰階紋理 + 邊緣密度」評分。
-    岩心槽通常明顯高於空的藍色槽；只接受從第 1 槽開始的連續前綴，
-    因此不會因單一空洞或碎石造成 1、3 兩槽被誤判成有岩心。
-    回傳 1..n；無法可靠判斷時回傳 n。
+def detect_occupied_rows(im, n=4):
+    """自動判斷最後一箱實際有幾槽岩心。
+
+    以每槽中央區域的「非藍色 / 灰岩比例 + 紋理 + 邊緣」判斷；
+    只取從第一槽開始的連續前綴。若所有槽都像有岩心，就回傳滿箱。
     """
     if n <= 1:
         return 1
 
-    hsv = cv2.cvtColor(im, cv2.COLOR_RGB2HSV)
-    blue = cv2.inRange(hsv, (85, 60, 45), (118, 255, 255)) > 0
-    gray = cv2.cvtColor(im, cv2.COLOR_RGB2GRAY)
-    H, W = im.shape[:2]
+    arr = np.asarray(im)
+    hsv = cv2.cvtColor(arr, cv2.COLOR_RGB2HSV)
+    gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+    H, W = arr.shape[:2]
 
     scores = []
-    for k in range(n):
-        y0 = int(H * (k / n + 0.06 / n))
-        y1 = int(H * ((k + 1) / n - 0.06 / n))
-        x0, x1 = int(W * .07), int(W * .93)
+    for k in range(int(n)):
+        # 避開上下隔板與左右箱壁。
+        y0 = int(H * (k / n + 0.12 / n))
+        y1 = int(H * ((k + 1) / n - 0.12 / n))
+        x0, x1 = int(W * 0.07), int(W * 0.93)
         if y1 <= y0 or x1 <= x0:
             return n
 
-        bm = blue[y0:y1, x0:x1]
+        s = hsv[y0:y1, x0:x1, 1].astype(np.float32)
+        v = hsv[y0:y1, x0:x1, 2].astype(np.float32)
         g = gray[y0:y1, x0:x1]
-        non_blue = float(1.0 - bm.mean())
-        texture = float(min(np.std(g) / 65.0, 1.0))
-        edge = float(min(cv2.Canny(g, 40, 120).mean() / 255.0 / .12, 1.0))
 
-        # 非藍色是主判斷，紋理/邊緣作輔助，降低土、箱壁反光造成的誤判。
-        score = .68 * non_blue + .20 * texture + .12 * edge
+        # 岩心大多是低飽和灰/褐色；空槽主要是高飽和藍色。
+        grayish = ((s < 105) & (v > 35)).mean()
+        dark_core = (v < 150).mean()
+        edge = cv2.Canny(g, 35, 110).mean() / 255.0
+        texture = min(float(np.std(g)) / 55.0, 1.0)
+
+        score = 0.58 * float(grayish) + 0.12 * float(dark_core) \
+              + 0.18 * min(texture, 1.0) + 0.12 * min(edge / 0.16, 1.0)
         scores.append(score)
 
-    # 明顯空槽通常 < 0.25；若前面有岩心，採用前兩槽的中位數作為自適應基準。
-    head = np.array(scores[:min(2, n)], dtype=float)
-    adaptive = max(0.27, float(np.median(head)) * 0.42)
-
-    occupied = [s >= adaptive for s in scores]
-
-    # 只取連續前綴；中間偶爾碎石不足不會把後面的箱號切掉。
-    k = 0
-    for ok in occupied:
-        if not ok:
-            break
-        k += 1
-
-    # 若每一槽都很接近、沒有明顯空槽，視為滿箱。
-    if k == 0 or all(s >= adaptive * 0.90 for s in scores):
+    scores = np.asarray(scores, dtype=float)
+    if not np.all(np.isfinite(scores)):
         return n
-    return max(1, min(n, k))
 
+    # 前兩槽通常都是有岩心的，用它們當「有岩心」基準。
+    head = float(np.median(scores[:min(2, n)]))
+    if head < 0.16:
+        return n
+
+    # 後面的槽若明顯低於前兩槽，就視為空槽；避免箱壁/碎石把它判成有岩心。
+    threshold = max(0.20, head * 0.48)
+    k = 0
+    for score in scores:
+        if score >= threshold:
+            k += 1
+        else:
+            break
+
+    # 若四槽都和前兩槽同一量級，視為滿箱。
+    if k == n or np.all(scores >= head * 0.82):
+        return n
+    return max(1, min(int(n), k))
 
 def crop_partial(im, k, n=4, margin=MARGIN):
     """最後一箱只有 k 列有岩心：保留前 k 槽（含其下方隔板），刪掉後面的空槽"""

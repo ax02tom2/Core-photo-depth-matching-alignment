@@ -1,5 +1,6 @@
 import io
 import inspect
+import re
 
 import cv2
 import numpy as np
@@ -23,7 +24,25 @@ build_docx = core.build_docx
 st.set_page_config(page_title="岩心照片校正與成果輸出", layout="wide")
 st.title("岩心箱照片：轉橫 → 箱內四角校正 → 成果輸出")
 
-APP_VERSION = "2.1"
+APP_VERSION = "2.2"
+
+
+def _parse_end_depth(text):
+    """從孔號自動讀出括號內的終深，例如 H25-1B(50m) -> 50。"""
+    m = re.search(r'[\(（]\s*(\d+(?:\.\d+)?)\s*m\s*[\)）]', str(text), re.I)
+    if not m:
+        return None
+    return float(m.group(1))
+
+
+def _depth_total_rows():
+    """有終深時直接以終深控制成果範圍，避免最後空槽被硬算進去。"""
+    end_depth = _parse_end_depth(hole)
+    if end_depth is None or row_m <= 0 or end_depth < start_depth:
+        return None
+    rows = int(round((end_depth - float(start_depth)) / float(row_m)))
+    return max(0, rows)
+
 
 # ---------------- 側邊欄 ----------------
 with st.sidebar:
@@ -66,11 +85,11 @@ with st.sidebar:
     row_m = st.number_input("每列代表深度 (m)", 1, 5, 1)
     per_page = st.number_input("每頁箱號數", 4, 40, 20, 4)
     last_rows = st.number_input(
-        "最後一箱實際有岩心的列數（0 = 自動判定）",
+        "最後一箱手動覆寫（0 = 自動）",
         0,
         10,
         0,
-        help="0 表示自動判斷；輸入 1～4 可覆寫自動結果。",
+        help="一般不用填；程式會依終深與照片自動處理。",
     )
     end_mark = st.checkbox("最後加「鑽探結束」", True)
     skip_warp = st.checkbox("照片已是正的，不做透視校正", False)
@@ -205,10 +224,17 @@ def get_pts(f):
     return p, touch, False
 
 
+
 def effective_last_rows():
-    """最後一張照片的實際岩心列數：手動覆寫 > 自動判定。"""
+    """最後一箱需要保留的槽數：手動覆寫 > 孔號終深 > 影像自動判斷。"""
     if last_rows:
         return min(int(last_rows), int(rows_per_box))
+
+    depth_rows = _depth_total_rows()
+    if depth_rows is not None:
+        rem = depth_rows % int(rows_per_box)
+        return int(rem or rows_per_box)
+
     last = files[-1]
     img = get_img(last)
     if not skip_warp:
@@ -218,7 +244,20 @@ def effective_last_rows():
 
 
 def total_rows_effective():
+    """成果總列數。孔號帶終深時優先用終深，這樣 50m 就絕對不會輸出 51、52。"""
+    depth_rows = _depth_total_rows()
+    if depth_rows is not None:
+        return depth_rows
     return (len(files) - 1) * int(rows_per_box) + int(effective_last_rows())
+
+
+def output_files_effective():
+    """只輸出終深以前需要的照片，多出的照片直接排除。"""
+    total = total_rows_effective()
+    if total <= 0:
+        return files
+    need = int(np.ceil(total / int(rows_per_box)))
+    return files[:min(len(files), need)]
 
 
 def box_image(f):
@@ -227,7 +266,8 @@ def box_image(f):
         pts, _, _ = get_pts(f)
         img = _warp_compat(img, pts)
     im = Image.fromarray(img)
-    if f.name == files[-1].name:
+    out_files = output_files_effective()
+    if out_files and f.name == out_files[-1].name:
         k = effective_last_rows()
         if k < rows_per_box:
             im = crop_partial(im, k, rows_per_box, (mgx, mgy))
@@ -237,7 +277,7 @@ def box_image(f):
 # ---------------- 1. 逐張檢查 ----------------
 st.subheader("1. 檢查每張照片的校正結果")
 status = {}
-for f in files:
+for f in output_files_effective():
     _, bad, man = get_pts(f)
     status[f.name] = "手動" if man else ("需確認" if bad else "自動OK")
 
@@ -276,7 +316,7 @@ for n in files:
         )
 st.markdown("".join(badge_html), unsafe_allow_html=True)
 
-names = [f.name for f in files]
+names = [f.name for f in output_files_effective()]
 if st.session_state.get("sel_photo") not in names:
     st.session_state["sel_photo"] = names[0]
 
@@ -294,18 +334,22 @@ sel = next(f for f in files if f.name == sel_name)
 sel_status = status[sel_name]
 
 if sel_status == "需確認":
-    st.error("⚠ 這張照片的自動角點品質較低，請看左圖紅框；紅框不貼箱外即可先使用，不準再改用手動四點。")
+    st.warning("⚠ 請檢查四個紅框角點")
 elif sel_status == "手動":
-    st.info("✋ 這張照片目前使用手動四角。")
+    st.info("✋ 手動角點")
 else:
-    st.success("✓ 自動角點檢測通過。")
+    st.success("✓ 自動完成")
 
-if sel.name == files[-1].name:
+out_files = output_files_effective()
+if out_files and sel.name == out_files[-1].name:
     auto_last = effective_last_rows()
-    if last_rows == 0:
-        st.info(f"最後一箱自動判定：**{auto_last}/{rows_per_box} 槽有岩心**。")
+    end_depth = _parse_end_depth(hole)
+    if end_depth is not None:
+        st.info(f"終深 {end_depth:g}m → 最後一箱保留 {auto_last}/{rows_per_box} 槽")
+    elif last_rows == 0:
+        st.info(f"自動：最後一箱 {auto_last}/{rows_per_box} 槽")
     else:
-        st.info(f"最後一箱使用手動設定：**{int(last_rows)}/{rows_per_box} 槽**。")
+        st.info(f"手動：最後一箱 {int(last_rows)}/{rows_per_box} 槽")
 
 r1, r2 = st.columns([1, 3])
 rot_val = r1.selectbox(
@@ -365,20 +409,24 @@ with st.expander("角點不準？手動點選箱內四個內角"):
 # ---------------- 2. 輸出 ----------------
 st.subheader("2. 輸出成果")
 _total_rows = total_rows_effective()
+out_files = output_files_effective()
+extra = max(0, len(files) - len(out_files))
 st.write(
-    f"共 {len(files)} 張照片 → **{_total_rows} 個箱號**，每頁 {per_page} 個箱號。"
+    f"輸出 **{len(out_files)} 張照片 / {_total_rows} 個箱號**，每頁 {per_page} 個箱號。"
 )
+if extra:
+    st.info(f"已自動排除終深後的 {extra} 張照片。")
 
 if st.button("產生 Word / PDF", type="primary"):
     boxes, bar = [], st.progress(0.0, "處理照片中…")
     failed = None
-    for i, f in enumerate(files):
+    for i, f in enumerate(out_files):
         try:
             boxes.append(box_image(f))
         except Exception as e:
             failed = (f.name, e)
             break
-        bar.progress((i + 1) / len(files))
+        bar.progress((i + 1) / len(out_files))
 
     if failed:
         bar.empty()
@@ -422,4 +470,4 @@ if "pdf" in st.session_state:
         mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     )
 
-st.caption(f"程式版本 {APP_VERSION}｜app/core 相容模式已啟用")
+st.caption(f"程式版本 {APP_VERSION}")
