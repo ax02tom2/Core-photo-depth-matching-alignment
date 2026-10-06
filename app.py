@@ -1,4 +1,5 @@
 import io
+import traceback
 
 import numpy as np
 import streamlit as st
@@ -35,15 +36,14 @@ with st.sidebar:
     st.caption("成果圖 = 箱內四個內角拉成長方形，外側只多留一點點邊（同範例 Word 的裁法）。")
     mgx = st.slider("左右多留 %", 0.0, 3.0, 0.4, 0.1) / 100
     mgy = st.slider("上下多留 %", 0.0, 3.0, 0.6, 0.1) / 100
-    rows_per_box = st.number_input("每箱列數", 1, 10, 4)
+    rows_per_box = int(st.number_input("每箱列數", 1, 10, 4))
     row_m = st.number_input("每列代表深度 (m)", 1, 5, 1)
-    per_page = st.number_input("每頁箱號數", 4, 40, 20, 4)
+    per_page = int(st.number_input("每頁箱號數", 4, 40, 20, 4))
     
-    # 修正：確保 last_rows 變數絕對會被定義，避免 NameError 崩潰
     last_rows = 0
     if not auto_last:
-        last_rows = st.number_input("最後一箱實際有岩心的列數（0 = 滿箱）", 0, 10, 0,
-                                    help="例：只鑽到 50m，最後一箱只有 49、50 兩列 → 填 2。")
+        last_rows = int(st.number_input("最後一箱實際有岩心的列數（0 = 滿箱）", 0, 10, 0,
+                                        help="例：只鑽到 50m，最後一箱只有 49、50 兩列 → 填 2。"))
         
     end_mark = st.checkbox("最後加「鑽探結束」", True)
     skip_warp = st.checkbox("照片已是正的，不做透視校正", False)
@@ -79,16 +79,15 @@ def get_img(f):
 
 
 def get_pts(f):
-    """回傳 (四角點, 是否貼邊/未偵測到, 是否手動)"""
     key = (f.name, cur_rot(f.name))
     if key in st.session_state["manual"]:
         return st.session_state["manual"][key], False, True
-    p, touch = _detect(f.name, f.getvalue(), pdir, cur_rot(f.name), inset_adj)
+    p, bad = _detect(f.name, f.getvalue(), pdir, cur_rot(f.name), inset_adj)
     if p is None:
         img = get_img(f)
         h, w = img.shape[:2]
         return np.array([[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]], np.float32), True, False
-    return p, touch, False
+    return p, bad, False
 
 
 def box_image(f):
@@ -98,7 +97,6 @@ def box_image(f):
         img = warp_points(img, pts, aspect=aspect, margin=(mgx, mgy))
     im = Image.fromarray(img)
     
-    # 處理最後一箱裁切
     if f.name == files[-1].name:       
         if auto_last:
             filled = auto_detect_filled_rows(img, rows_per_box)
@@ -124,12 +122,11 @@ for f in files:
     else:
         status[f.name] = "✅ 自動OK"
 
-# 新增：異常照片自動警示區塊
 if abnormal_files:
-    st.error("⚠️ **系統判定以下照片可能「歪斜過大」或「內角辨識異常」，強烈建議您點選查看並進行人工微調：**\n\n" + 
+    st.error("⚠️ **系統判定以下照片紅框可能「歪斜扭曲」或「比例異常」，強烈建議您點選下方清單查看，並展開「手動點選箱內四個內角」進行人工標註：**\n\n" + 
              ", ".join([f"`{name}`" for name in abnormal_files]))
 else:
-    st.success("✅ 系統判視：所有照片初步辨識皆正常！")
+    st.success("✅ 系統判視：所有照片幾何比例皆屬正常範圍！")
 
 st.caption("全部狀態：" + " ".join(f"{n}：{s}" for n, s in status.items()))
 
@@ -202,21 +199,20 @@ st.write(f"設定總頁數排版，每頁 {per_page} 個箱號。")
 if st.button("產生 Word / PDF", type="primary"):
     boxes, bar = [], st.progress(0.0, "處理照片中…")
     
-    # 計算實際的最後一箱列數 (修正狀態不同步的問題)
-    actual_last_rows = last_rows
+    # 確保資料型態為整數，避免 TypeError 崩潰
+    actual_last_rows = int(last_rows)
     if auto_last:
         last_img_raw = get_img(files[-1])
         last_pts, _, _ = get_pts(files[-1])
         last_warped = last_img_raw if skip_warp else warp_points(last_img_raw, last_pts, aspect=aspect, margin=(mgx, mgy))
-        actual_last_rows = auto_detect_filled_rows(last_warped, rows_per_box)
+        actual_last_rows = int(auto_detect_filled_rows(last_warped, rows_per_box))
 
-    total_calc_rows = ((len(files) - 1) * rows_per_box + actual_last_rows) if (actual_last_rows and actual_last_rows < rows_per_box) else len(files) * rows_per_box
+    total_calc_rows = int(((len(files) - 1) * rows_per_box + actual_last_rows) if (actual_last_rows and actual_last_rows < rows_per_box) else len(files) * rows_per_box)
 
     for i, f in enumerate(files):
         boxes.append(box_image(f))
         bar.progress((i + 1) / len(files))
         
-    # 將上傳的圖片轉為 bytes 傳遞，解決重複讀取造成的 EOF 崩潰
     board_bytes = board_up.getvalue() if board_up else None
     
     kw = dict(hole=hole, date=date, project=project, start_depth=start_depth,
@@ -224,12 +220,17 @@ if st.button("產生 Word / PDF", type="primary"):
               board=board_bytes, end_mark=end_mark,
               total_rows=total_calc_rows)
               
-    st.session_state["pdf"] = build_pdf(boxes, **kw)
-    st.session_state["docx"] = build_docx(boxes, **kw)
-    bar.empty()
-    st.success(f"完成！共處理 {len(files)} 張照片，涵蓋 {total_calc_rows} 個箱號。")
+    try:
+        st.session_state["pdf"] = build_pdf(boxes, **kw)
+        st.session_state["docx"] = build_docx(boxes, **kw)
+        bar.empty()
+        st.success(f"完成！共處理 {len(files)} 張照片，涵蓋 {total_calc_rows} 個箱號。")
+    except Exception as e:
+        bar.empty()
+        st.error(f"產出報告時發生程式錯誤，請截圖提供給開發者：\n{e}")
+        st.code(traceback.format_exc())
 
-if "pdf" in st.session_state:
+if "pdf" in st.session_state and "docx" in st.session_state:
     d1, d2 = st.columns(2)
     d1.download_button("下載 PDF", st.session_state["pdf"], file_name=f"{hole}_岩心照片.pdf",
                        mime="application/pdf")
