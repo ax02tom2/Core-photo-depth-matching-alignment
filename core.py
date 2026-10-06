@@ -22,6 +22,7 @@ PAGE_MX, PAGE_MY = 2.0, 1.0
 HEADER_W, HEADER_H = 15.4, 3.17
 BOX_W, BOX_H = 15.15, 4.85
 NUM_COL_W = 1.0
+FULL_ASPECT = 3.12  # 滿箱成果圖寬/高（= BOX_W/BOX_H，範例 Word 的顯示比例）
 
 SERIF_PATHS = [
     "/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc",
@@ -157,7 +158,7 @@ def _blue_mask(sm):
     return cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
 
 
-def detect_inner(img, full_aspect=3.1):
+def _detect_holes(img, full_aspect=3.1):
     """找「岩心所在的那一格」＝藍色岩心箱內側的四個內角（橘框）。
     做法：藍色箱壁/隔板會圍出 4 個「洞」（每個洞 = 一條岩心槽），
     把這幾個洞合起來取外框，再縮成 4 個角。腳、土、旁邊的箱子不會形成這種洞，所以不受影響。
@@ -200,6 +201,12 @@ def detect_inner(img, full_aspect=3.1):
     return order_pts(quad / sc), bool(bad)
 
 
+# 使用者手點的四個點 = 岩心箱「內側四角」。量測：這四點相對於箱子外緣（藍色箱緣最外側）
+# 的位置，左 2.1%、右 2.2%、上 6.1%、下 7.4%（四個角彼此一致，與範例 Word 的裁切也吻合）。
+TRAY_INSET = (0.021, 0.022, 0.061, 0.074)  # 左、右、上、下（佔外框寬/高的比例）
+MARGIN = (0.004, 0.006)                    # 成果圖內框外側多留的邊（x, y 佔成果圖比例）
+
+
 def _warp_to(img, pts, out_w, out_h, inner):
     l, r, t, b = inner
     x0, x1 = out_w * l, out_w * (1 - r)
@@ -210,54 +217,144 @@ def _warp_to(img, pts, out_w, out_h, inner):
                                borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0))
 
 
-def _crop_to_rim(img, inner, shrink=0.003):
-    """從內框往外，沿連續的藍色箱緣找到箱子的外緣，裁掉外面的土、雜物與多餘邊角"""
-    h, w = img.shape[:2]
-    l, r, t, b = inner
-    hsv = cv2.cvtColor(cv2.resize(img, (w // 2, h // 2)), cv2.COLOR_RGB2HSV)
+def _walk_out(line, start, step, cap, gap=6, find=40):
+    """從 start 往外找到第一個藍色，再沿藍色走到箱子外緣（容許小缺口）；找不到回傳 None"""
+    n = len(line)
+    i, k = start, 0
+    while 0 <= i < n and not line[i] and k < find:
+        i += step
+        k += 1
+    if not (0 <= i < n and line[i]):
+        return None
+    last, miss, k = i, 0, 0
+    while 0 <= i + step < n and k < cap:
+        i += step
+        k += 1
+        if line[i]:
+            last, miss = i, 0
+        else:
+            miss += 1
+            if miss >= gap:
+                break
+    return last
+
+
+def _fit_line_robust(pts):
+    pts = np.array(pts, np.float32)
+    if len(pts) < 12:
+        return None
+    for _ in range(2):
+        vx, vy, x0, y0 = cv2.fitLine(pts, cv2.DIST_HUBER, 0, 0.01, 0.01).ravel()
+        nrm = np.array([-vy, vx])
+        res = np.abs((pts - np.array([x0, y0])) @ nrm)
+        keep = res <= max(1.5, 2.5 * np.median(res) + 1)
+        if keep.sum() < 12:
+            break
+        pts = pts[keep]
+    return np.array([x0, y0]), np.array([vx, vy])
+
+
+def _outer_quad(w, big):
+    """在（已大致拉正的）圖上，沿藍色箱緣找出箱子最外緣四條邊，再取交點。
+    外緣是長直線，比端壁階梯、隔板的內角穩定，所以歪斜可以在這裡一次修正。"""
+    h, wd = w.shape[:2]
+    hsv = cv2.cvtColor(cv2.resize(w, (wd // 2, h // 2)), cv2.COLOR_RGB2HSV)
     m = cv2.inRange(hsv, (85, 70, 50), (118, 255, 255)) > 0
     h2, w2 = m.shape
+    l, r, t, b = big
     x0, x1 = int(w2 * l), int(w2 * (1 - r))
     y0, y1 = int(h2 * t), int(h2 * (1 - b))
-    colf = m[y0 + (y1 - y0) // 6: y1 - (y1 - y0) // 6, :].mean(axis=0)
-    rowf = m[:, x0 + (x1 - x0) // 6: x1 - (x1 - x0) // 6].mean(axis=0 if False else 1)
-
-    def walk(prof, start, step, limit, thr=0.3):
-        i, n = start, 0
-        while 0 <= i + step < len(prof) and n < limit:
-            if prof[i + step] < thr:
-                break
-            i += step
-            n += 1
-        return i
-
     capx, capy = int(w2 * 0.06), int(h2 * 0.11)
-    xl = walk(colf, x0, -1, capx)
-    xr = walk(colf, x1, +1, capx)
-    yt = walk(rowf, y0, -1, capy)
-    yb = walk(rowf, y1, +1, capy)
-    sx, sy = int(shrink * w), int(shrink * h)
-    return img[max(0, yt * 2 + sy):min(h, yb * 2 - sy), max(0, xl * 2 + sx):min(w, xr * 2 - sx)]
+    L, R, T, B = [], [], [], []
+    for y in range(y0 + (y1 - y0) // 8, y1 - (y1 - y0) // 8, 2):
+        a = _walk_out(m[y], x0, -1, capx)
+        if a is not None:
+            L.append((a, y))
+        a = _walk_out(m[y], x1, +1, capx)
+        if a is not None:
+            R.append((a, y))
+    for x in range(x0 + (x1 - x0) // 8, x1 - (x1 - x0) // 8, 2):
+        a = _walk_out(m[:, x], y0, -1, capy)
+        if a is not None:
+            T.append((x, a))
+        a = _walk_out(m[:, x], y1, +1, capy)
+        if a is not None:
+            B.append((x, a))
+    lines = [_fit_line_robust(T), _fit_line_robust(R), _fit_line_robust(B), _fit_line_robust(L)]
+    if any(ln is None for ln in lines):
+        return None
+    q = []
+    for i in range(4):
+        p1, d1 = lines[(i - 1) % 4]
+        p2, d2 = lines[i]
+        A = np.array([d1, -d2]).T
+        if abs(np.linalg.det(A)) < 1e-6:
+            return None
+        tt = np.linalg.solve(A, p2 - p1)
+        q.append(p1 + tt[0] * d1)
+    return np.array(q, np.float32) * 2
 
 
-def warp_inner(img, pts, out_w=2400, aspect=3.1, shrink=0.003):
-    """內角 → 拉正（兩段式：第二段在拉正後的圖上重新偵測內角再校一次），
-    最後依藍色箱緣裁到箱子外緣，成果與範例 Word 的整箱圖一致。"""
-    big = (0.07, 0.07, 0.14, 0.14)
-    cw = out_w
+def detect_inner(img, full_aspect=3.1):
+    """自動找出「岩心箱內側四角」（與使用者手點的四個點同一定義）。
+    1) 先用岩心槽（藍色隔板圍出的洞）粗略拉正；
+    2) 在拉正圖上找藍色箱緣最外側四條邊 → 外框四角（直線擬合，抗歪斜）；
+    3) 外框依固定比例（TRAY_INSET）內縮 → 內側四角，再轉回原圖座標。
+    回傳 (pts, bad)；bad=True 表示不可靠，請手動點。"""
+    ph, bad = _detect_holes(img, full_aspect)
+    if ph is None:
+        return None, True
+    cw = 2400
     ch = int(cw / 2.9)
-    w1 = _warp_to(img, pts, cw, ch, big)
-    p2, bad2 = detect_inner(w1)
-    ok2 = False
-    if p2 is not None and not bad2:
-        l, r, t, b = big
-        exp = np.array([[cw * l, ch * t], [cw * (1 - r), ch * t],
-                        [cw * (1 - r), ch * (1 - b)], [cw * l, ch * (1 - b)]], np.float32)
-        ok2 = bool(np.abs(order_pts(p2) - exp).max() < 0.035 * cw)  # 偏離太多＝第二段偵測錯，不採用
-    w2 = _warp_to(w1, p2, cw, ch, big) if ok2 else w1
-    crop = _crop_to_rim(w2, big, shrink)
-    oh = int(out_w / aspect)
-    return cv2.resize(crop, (out_w, oh), interpolation=cv2.INTER_AREA)
+    big = (0.07, 0.07, 0.14, 0.14)
+    l, r, t, b = big
+    dst = np.array([[cw * l, ch * t], [cw * (1 - r), ch * t],
+                    [cw * (1 - r), ch * (1 - b)], [cw * l, ch * (1 - b)]], np.float32)
+    M1 = cv2.getPerspectiveTransform(order_pts(ph), dst)
+    w1 = cv2.warpPerspective(img, M1, (cw, ch), flags=cv2.INTER_LINEAR,
+                             borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0))
+    oq = _outer_quad(w1, big)
+    if oq is None:
+        return ph, True
+    # 合理性：外框必須把岩心槽範圍包起來，且大小在合理範圍
+    ow = (np.linalg.norm(oq[1] - oq[0]) + np.linalg.norm(oq[2] - oq[3])) / 2
+    oh = (np.linalg.norm(oq[3] - oq[0]) + np.linalg.norm(oq[2] - oq[1])) / 2
+    inner_w, inner_h = cw * (1 - l - r), ch * (1 - t - b)
+    if not (1.0 < ow / inner_w < 1.25 and 1.0 < oh / inner_h < 1.45):
+        return ph, True
+    H = cv2.getPerspectiveTransform(oq, np.float32([[0, 0], [1, 0], [1, 1], [0, 1]]))
+    fl, fr, ft, fb = TRAY_INSET
+    inn = np.float32([[fl, ft], [1 - fr, ft], [1 - fr, 1 - fb], [fl, 1 - fb]])
+    p_w1 = cv2.perspectiveTransform(inn.reshape(-1, 1, 2), np.linalg.inv(H)).reshape(-1, 2)
+    p = cv2.perspectiveTransform(p_w1.reshape(-1, 1, 2), np.linalg.inv(M1)).reshape(-1, 2)
+    p = order_pts(p)
+    hh, ww = img.shape[:2]
+    bad = bool(bad or np.any(p[:, 0] < 0) or np.any(p[:, 1] < 0)
+               or np.any(p[:, 0] > ww - 1) or np.any(p[:, 1] > hh - 1))
+    return p, bad
+
+
+def warp_points(img, pts, out_w=2400, aspect=3.12, margin=MARGIN):
+    """把「內側四角」直接拉成長方形（成果圖＝內框 + 極小邊），跟範例 Word 的裁切一致。
+    手動點的四點與自動偵測的四點都走這一個函式，所以結果一致。"""
+    mx, my = margin
+    out_h = int(out_w / aspect)
+    x0, x1 = out_w * mx, out_w * (1 - mx)
+    y0, y1 = out_h * my, out_h * (1 - my)
+    dst = np.array([[x0, y0], [x1, y0], [x1, y1], [x0, y1]], np.float32)
+    M = cv2.getPerspectiveTransform(order_pts(pts), dst)
+    return cv2.warpPerspective(img, M, (out_w, out_h), flags=cv2.INTER_CUBIC,
+                               borderMode=cv2.BORDER_REPLICATE)
+
+
+def crop_partial(im, k, n=4, margin=MARGIN):
+    """最後一箱只有 k 列有岩心：保留前 k 槽（含其下方隔板），刪掉後面的空槽"""
+    if not k or k >= n:
+        return im
+    mx, my = margin
+    H = im.height
+    cut = (my + (1 - 2 * my) * k / n + 0.010) * H
+    return im.crop((0, 0, im.width, int(min(H, cut))))
 
 
 def draw_corners(img, pts, color=(255, 0, 0)):
@@ -352,16 +449,18 @@ def build_pdf(boxes, hole, date, project, start_depth=0, rows_per_box=4,
         hi = make_header(hole, depth, date, project, board)
         c.drawImage(ImageReader(_jpeg(hi, 92)), x0, y - HEADER_H * cm, HEADER_W * cm, HEADER_H * cm)
         y -= HEADER_H * cm
-        rh = BOX_H * cm / rows_per_box
         for i, im in enumerate(chunk):
-            c.drawImage(ImageReader(_jpeg(im)), x0, y - BOX_H * cm, BOX_W * cm, BOX_H * cm)
+            h_cm = BOX_H * (im.height * FULL_ASPECT / im.width)   # 滿箱 = BOX_H；只畫一半的箱子 = 一半高
+            c.drawImage(ImageReader(_jpeg(im)), x0, y - h_cm * cm, BOX_W * cm, h_cm * cm)
             c.setFont("Helvetica", 16)
+            mx_, my_ = MARGIN
             for k in range(rows_per_box):
                 num = r0 + i * rows_per_box + k + 1
                 if total_rows and num > total_rows:
                     break
-                c.drawString(x0 + (HEADER_W + 0.3) * cm, y - (k + 0.5) * rh - 5.5, str(num))
-            y -= BOX_H * cm
+                frac = my_ + (1 - 2 * my_) * (k + 0.5) / rows_per_box   # 該列中心在滿箱圖中的位置
+                c.drawString(x0 + (HEADER_W + 0.3) * cm, y - BOX_H * frac * cm - 5.5, str(num))
+            y -= h_cm * cm
         if r0 + n >= (total_rows or len(boxes) * rows_per_box) and end_mark:
             ti = _text_img("鑽探結束", 60)
             if ti is not None:  # 轉成圖片，任何閱讀器都不缺字
@@ -444,12 +543,13 @@ def build_docx(boxes, hole, date, project, start_depth=0, rows_per_box=4,
         rh = BOX_H / rows_per_box
         for i, im in enumerate(chunk):
             row = tbl.rows[i + 1]
-            row.height, row.height_rule = Cm(BOX_H), WD_ROW_HEIGHT_RULE.EXACTLY
+            h_cm = BOX_H * (im.height * FULL_ASPECT / im.width)
+            row.height, row.height_rule = Cm(h_cm), WD_ROW_HEIGHT_RULE.EXACTLY
             for j, wd in enumerate(widths):
                 row.cells[j].width = wd
             p = row.cells[0].paragraphs[0]
             tight(p)
-            p.add_run().add_picture(_jpeg(im), width=Cm(BOX_W), height=Cm(BOX_H - 0.05))
+            p.add_run().add_picture(_jpeg(im), width=Cm(BOX_W), height=Cm(h_cm - 0.05))
             cell = row.cells[1]
             for k in range(rows_per_box):
                 p = cell.paragraphs[0] if k == 0 else cell.add_paragraph()
