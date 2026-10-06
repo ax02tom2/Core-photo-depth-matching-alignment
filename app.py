@@ -13,7 +13,7 @@ import streamlit.components.v1 as components
 
 import core
 
-APP_VERSION = "2.6"
+APP_VERSION = "2.7"
 DETECTOR_VERSION = getattr(core, "DETECTOR_VERSION", "unknown")
 
 natural_key = core.natural_key
@@ -30,7 +30,7 @@ _COMPONENT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "point
 point_editor = components.declare_component("point_editor", path=_COMPONENT_DIR)
 
 st.set_page_config(page_title="岩心照片校正與成果輸出", layout="wide")
-st.title("岩心箱照片：自動抓角點 → 拖曳微調 → 成果輸出")
+st.title("岩心箱照片校正與成果輸出")
 
 
 def _parse_end_depth(text):
@@ -41,13 +41,15 @@ def _parse_end_depth(text):
 # ---------------- 側邊欄 ----------------
 with st.sidebar:
     st.header("成果表頭")
-    project = st.text_input("工程名稱", "114 年度鵠鵠崙地區潛在大規模崩塌調查監測計畫")
-    hole = st.text_input("孔號", "H25-1B(50m)")
-    date = st.text_input("日期", "114.3.29")
+    project = st.text_input("工程名稱", "")
+    hole = st.text_input("孔號", "")
+    date_value = st.date_input("日期", value=None, format="YYYY.MM.DD")
+    date = date_value.strftime("%Y.%m.%d") if date_value else ""
     start_depth = st.number_input("起始深度 (m)", 0, 500, 0)
     board_up = st.file_uploader(
         "自訂表頭告示牌照片（選填）", type=["jpg", "jpeg", "png"]
     )
+    st.caption("工程名稱、孔號、日期預設留白；日期可用日曆選取。")
 
     st.header("轉向 / 校正")
     portrait_dir = st.radio(
@@ -58,17 +60,11 @@ with st.sidebar:
     global_rot = st.selectbox("全部照片額外旋轉（逆時針）", [0, 90, 180, 270], index=0)
     aspect = st.number_input("成果圖整箱寬／高", 1.5, 5.0, 3.12, 0.01)
 
-    st.header("最後深度")
-    row_m = st.number_input("每槽代表深度 (m)", 0.1, 5.0, 1.0, 0.1)
-    rows_per_box = st.number_input("每箱槽數", 1, 10, 4)
-    partial_depth_m = st.number_input(
-        "最後一箱保留深度 (m)（0 = 依孔號終深自動）",
-        0.0,
-        float(rows_per_box * row_m),
-        0.0,
-        0.1,
-        help="每槽 1m 時：1m=1槽、2m=2槽。H25-1B(50m) 留白時會自動保留 49、50。",
-    )
+    # 深度與槽數固定為：每槽 1m、每箱 4 槽。
+    # 最後深度直接從「孔號」中的 (50m) 之類文字自動判讀；不再提供容易混淆的最後深度輸入。
+    ROW_M = 1.0
+    rows_per_box = 4
+    st.header("版面")
     per_page = st.number_input("每頁箱號數", 4, 40, 20, 4)
     end_mark = st.checkbox("最後加「鑽探結束」", True)
     skip_warp = st.checkbox("照片已是正的，不做透視校正", False)
@@ -83,14 +79,16 @@ if not files:
     st.stop()
 
 files = sorted(files, key=lambda f: natural_key(f.name))
-for k in ("manual", "rot", "crop_cfg"):
+for k in ("manual", "rot", "crop_cfg", "edit_nonce", "crop_nonce"):
     st.session_state.setdefault(k, {})
-st.session_state.setdefault("state_version", "2.6")
-if st.session_state.get("state_version") != "2.6":
+st.session_state.setdefault("state_version", "2.7")
+if st.session_state.get("state_version") != "2.7":
     st.session_state["manual"].clear()
     st.session_state["rot"].clear()
     st.session_state["crop_cfg"].clear()
-    st.session_state["state_version"] = "2.6"
+    st.session_state["edit_nonce"].clear()
+    st.session_state["crop_nonce"].clear()
+    st.session_state["state_version"] = "2.7"
 
 pdir = "ccw" if portrait_dir == "逆時針" else "cw"
 
@@ -121,6 +119,14 @@ def _photo_cfg(name, rot):
         {"mgx": 0.004, "mgy": 0.006, "source_pad": 0.004},
     )
     return cfg
+
+
+def _nonce(store_name, key):
+    return int(st.session_state[store_name].get(key, 0))
+
+
+def _bump_nonce(store_name, key):
+    st.session_state[store_name][key] = _nonce(store_name, key) + 1
 
 
 def _expand_source_quad(pts, pad):
@@ -161,9 +167,9 @@ def get_pts(f):
 
 def _depth_total_rows():
     end_depth = _parse_end_depth(hole)
-    if end_depth is None or row_m <= 0 or end_depth < start_depth:
+    if end_depth is None or end_depth < start_depth:
         return None
-    return max(0, int(round((end_depth - float(start_depth)) / float(row_m))))
+    return max(0, int(round((end_depth - float(start_depth)) / ROW_M)))
 
 
 def detect_occupied_rows(im, n=4):
@@ -177,9 +183,6 @@ def detect_occupied_rows(im, n=4):
 
 
 def effective_last_rows():
-    if partial_depth_m > 0:
-        return max(1, min(int(rows_per_box), int(np.ceil(partial_depth_m / row_m))))
-
     depth_rows = _depth_total_rows()
     if depth_rows is not None:
         rem = depth_rows % int(rows_per_box)
@@ -197,8 +200,6 @@ def effective_last_rows():
 
 def total_rows_effective():
     depth_rows = _depth_total_rows()
-    if partial_depth_m > 0:
-        return max(0, (len(files) - 1) * int(rows_per_box) + effective_last_rows())
     if depth_rows is not None:
         return int(depth_rows)
     return (len(files) - 1) * int(rows_per_box) + effective_last_rows()
@@ -260,7 +261,7 @@ def _draggable_points(img, pts, key):
 
 # ---------------- 1. 檢查 ----------------
 st.subheader("1. 照片檢查")
-st.error("⚠ 重要：自動抓角點只供初判。請在產生成果前，務必逐張看過左側 4 個角點與右側「校正後」結果。")
+st.error("⚠ 重要：自動抓角點只供初判。產生成果前，請逐張檢查左側四個角點與右側校正結果。")
 
 out_files = output_files_effective()
 status = {}
@@ -302,22 +303,24 @@ sel = next(f for f in out_files if f.name == sel_name)
 ck = (sel.name, cur_rot(sel.name))
 
 cfg = _photo_cfg(sel.name, cur_rot(sel.name))
-q1, q2, q3 = st.columns(3)
-with q1:
-    cfg["mgx"] = st.slider(
-        "本張左右多留 %", 0.0, 3.0, float(cfg["mgx"] * 100), 0.1,
-        key=f"mgx_{sel.name}_{ck[1]}",
-    ) / 100
-with q2:
-    cfg["mgy"] = st.slider(
-        "本張上下多留 %", 0.0, 3.0, float(cfg["mgy"] * 100), 0.1,
-        key=f"mgy_{sel.name}_{ck[1]}",
-    ) / 100
-with q3:
-    cfg["source_pad"] = st.slider(
-        "本張角點向外安全留邊 %", 0.0, 2.0, float(cfg["source_pad"] * 100), 0.1,
-        key=f"pad_{sel.name}_{ck[1]}",
-    ) / 100
+with st.container(border=True):
+    st.markdown("#### 本張調整")
+    q1, q2, q3 = st.columns(3)
+    with q1:
+        cfg["mgx"] = st.slider(
+            "左右留邊 %", 0.0, 3.0, float(cfg["mgx"] * 100), 0.1,
+            key=f"mgx_{sel.name}_{ck[1]}_{_nonce('crop_nonce', ck)}",
+        ) / 100
+    with q2:
+        cfg["mgy"] = st.slider(
+            "上下留邊 %", 0.0, 3.0, float(cfg["mgy"] * 100), 0.1,
+            key=f"mgy_{sel.name}_{ck[1]}_{_nonce('crop_nonce', ck)}",
+        ) / 100
+    with q3:
+        cfg["source_pad"] = st.slider(
+            "角點向外留邊 %", 0.0, 2.0, float(cfg["source_pad"] * 100), 0.1,
+            key=f"pad_{sel.name}_{ck[1]}_{_nonce('crop_nonce', ck)}",
+        ) / 100
 
 rot_val = st.selectbox(
     "此張額外旋轉（逆時針）", [0, 90, 180, 270],
@@ -341,9 +344,9 @@ else:
 
 colA, colB = st.columns(2)
 with colA:
-    st.caption("拖曳左圖 4 個黃色角點：左上 → 右上 → 右下 → 左下")
+    st.caption("拖曳黃色角點調整箱框")
     if pts is not None:
-        edited = _draggable_points(img, pts, key=f"point_editor_{sel.name}_{ck[1]}")
+        edited = _draggable_points(img, pts, key=f"point_editor_{sel.name}_{ck[1]}_{_nonce('edit_nonce', ck)}")
         if edited is not None and np.max(np.abs(edited - np.asarray(pts))) > 0.5:
             st.session_state["manual"][ck] = edited.astype(np.float32)
             st.rerun()
@@ -361,21 +364,24 @@ with colB:
     else:
         st.info("沒有可用角點")
 
-b1, b2 = st.columns(2)
-if b1.button("恢復本張自動角點"):
+with st.container(border=True):
+    b1, b2 = st.columns(2)
+    reset_auto = b1.button("恢復本張自動角點")
+    reset_crop = b2.button("重設本張裁切留邊")
+if reset_auto:
     st.session_state["manual"].pop(ck, None)
+    _bump_nonce("edit_nonce", ck)
     st.rerun()
-if b2.button("重設本張裁切留邊"):
+if reset_crop:
     st.session_state["crop_cfg"].pop(ck, None)
+    _bump_nonce("crop_nonce", ck)
     st.rerun()
 
 out_files = output_files_effective()
 if out_files and sel.name == out_files[-1].name:
     last_k = effective_last_rows()
     end_depth = _parse_end_depth(hole)
-    if partial_depth_m > 0:
-        st.info(f"最後一箱：{partial_depth_m:g}m = {last_k} 槽（1m=1槽）")
-    elif end_depth is not None:
+    if end_depth is not None:
         st.info(f"終深 {end_depth:g}m → 最後一箱保留 {last_k} 槽；超過終深的槽直接不輸出")
     else:
         st.info(f"最後一箱：自動判定 {last_k} 槽")
@@ -385,7 +391,7 @@ st.subheader("2. 輸出成果")
 _total_rows = total_rows_effective()
 out_files = output_files_effective()
 st.write(f"輸出 {len(out_files)} 張照片 / {_total_rows} 個箱號，每頁 {per_page} 個箱號。")
-st.warning("⚠ 自動判定僅供初判；產生 Word / PDF 前，請務必逐張檢查照片。")
+st.warning("⚠ 產生成果前請逐張檢查；可直接拖曳黃色角點修正。")
 extra = max(0, len(files) - len(out_files))
 if extra:
     st.info(f"已自動排除終深後的 {extra} 張照片。")
@@ -414,7 +420,7 @@ if st.button("產生 Word / PDF", type="primary"):
             start_depth=start_depth,
             rows_per_box=rows_per_box,
             per_page=per_page,
-            row_m=row_m,
+            row_m=ROW_M,
             board=board_up if board_up else None,
             end_mark=end_mark,
             total_rows=_total_rows,
