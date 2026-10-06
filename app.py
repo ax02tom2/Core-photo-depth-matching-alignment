@@ -24,7 +24,7 @@ build_docx = core.build_docx
 st.set_page_config(page_title="岩心照片校正與成果輸出", layout="wide")
 st.title("岩心箱照片：轉橫 → 箱內四角校正 → 成果輸出")
 
-APP_VERSION = "2.3"
+APP_VERSION = "2.4"
 
 
 def _parse_end_depth(text):
@@ -81,15 +81,16 @@ with st.sidebar:
         help="只增加來源安全邊；不改變最後成果比例。",
     ) / 100
 
-    rows_per_box = st.number_input("每箱列數", 1, 10, 4)
-    row_m = st.number_input("每列代表深度 (m)", 1, 5, 1)
     per_page = st.number_input("每頁箱號數", 4, 40, 20, 4)
-    last_rows = st.number_input(
-        "最後一箱手動覆寫（0 = 自動）",
-        0,
-        10,
-        0,
-        help="一般不用填；程式會依終深與照片自動處理。",
+    rows_per_box = st.number_input("每箱列數", 1, 10, 4)
+    row_m = st.number_input("每槽代表深度 (m)", 0.1, 5.0, 1.0, 0.1)
+    partial_depth_m = st.number_input(
+        "最後一箱實際深度 (m)（0 = 自動）",
+        0.0,
+        float(rows_per_box * row_m),
+        0.0,
+        0.1,
+        help="每槽 1m 時：1m = 1 槽、2m = 2 槽。H25-1B(50m) 不填時會依終深自動保留最後 2 槽。",
     )
     end_mark = st.checkbox("最後加「鑽探結束」", True)
     skip_warp = st.checkbox("照片已是正的，不做透視校正", False)
@@ -104,7 +105,7 @@ if not files:
     st.stop()
 
 files = sorted(files, key=lambda f: natural_key(f.name))
-for k in ("manual", "clicks", "rot"):
+for k in ("manual", "clicks", "rot", "confirmed"):
     st.session_state.setdefault(k, {})
 pdir = "ccw" if portrait_dir == "逆時針" else "cw"
 
@@ -208,27 +209,29 @@ def detect_occupied_rows(im, n=4):
 
 
 def get_pts(f):
-    """回傳 (四角點, 是否需確認, 是否手動)。"""
+    """回傳 (四角點, 自動抓不到, 是否手動)。
+
+    本版不再替使用者判定「自動OK」。只負責提供自動角點，最後一定由使用者逐張確認。
+    """
     key = (f.name, cur_rot(f.name))
     if key in st.session_state["manual"]:
         return st.session_state["manual"][key], False, True
-    p, touch = _detect(f.name, f.getvalue(), pdir, cur_rot(f.name))
+    p, _touch = _detect(f.name, f.getvalue(), pdir, cur_rot(f.name))
     if p is None:
-        img = get_img(f)
-        h, w = img.shape[:2]
-        return (
-            np.array([[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]], np.float32),
-            True,
-            False,
-        )
-    return p, touch, False
+        return None, True, False
+    return p, False, False
 
 
 
 def effective_last_rows():
-    """最後一箱需要保留的槽數：手動覆寫 > 孔號終深 > 影像自動判斷。"""
-    if last_rows:
-        return min(int(last_rows), int(rows_per_box))
+    """最後一箱保留幾槽。
+
+    優先順序：手動「最後一箱實際深度(m)」 > 孔號終深 > 最後照片影像判定。
+    每槽深度 row_m=1 時，1m 就是 1 槽，2m 就是 2 槽。
+    """
+    if partial_depth_m > 0:
+        rows = int(np.ceil(float(partial_depth_m) / float(row_m)))
+        return max(1, min(int(rows_per_box), rows))
 
     depth_rows = _depth_total_rows()
     if depth_rows is not None:
@@ -237,17 +240,21 @@ def effective_last_rows():
 
     last = files[-1]
     img = get_img(last)
+    pts, failed, _ = get_pts(last)
+    if failed or pts is None:
+        return int(rows_per_box)
     if not skip_warp:
-        pts, _, _ = get_pts(last)
         img = _warp_compat(img, pts)
     return detect_occupied_rows(img, int(rows_per_box))
 
-
 def total_rows_effective():
-    """成果總列數。孔號帶終深時優先用終深，這樣 50m 就絕對不會輸出 51、52。"""
+    """成果總列數。手動最後一箱深度優先，其次使用孔號終深。"""
     depth_rows = _depth_total_rows()
+    if partial_depth_m > 0:
+        full_before = max(0, len(files) - 1) * int(rows_per_box)
+        return full_before + int(effective_last_rows())
     if depth_rows is not None:
-        return depth_rows
+        return int(depth_rows)
     return (len(files) - 1) * int(rows_per_box) + int(effective_last_rows())
 
 
@@ -263,7 +270,9 @@ def output_files_effective():
 def box_image(f):
     img = get_img(f)
     if not skip_warp:
-        pts, _, _ = get_pts(f)
+        pts, failed, _ = get_pts(f)
+        if failed or pts is None:
+            raise ValueError("這張照片尚未設定可用的四個角點")
         img = _warp_compat(img, pts)
     im = Image.fromarray(img)
     out_files = output_files_effective()
@@ -275,47 +284,33 @@ def box_image(f):
 
 
 # ---------------- 1. 逐張檢查 ----------------
-st.subheader("1. 檢查每張照片的校正結果")
+st.subheader("1. 每張照片都要檢查確認")
+st.caption("自動角點只提供初始位置，不自動判定正確與否；所有照片都必須由你確認後，才能產生成果。")
+
+out_files = output_files_effective()
 status = {}
-for f in output_files_effective():
-    _, bad, man = get_pts(f)
-    status[f.name] = "手動" if man else ("需確認" if bad else "自動OK")
+valid_pts = {}
+confirmed_now = {}
+for f in out_files:
+    pts, failed, man = get_pts(f)
+    ck = (f.name, cur_rot(f.name))
+    valid = pts is not None and not failed
+    valid_pts[f.name] = (pts, valid, man)
+    ok = bool(st.session_state["confirmed"].get(ck, False)) and valid
+    confirmed_now[f.name] = ok
+    status[f.name] = "已確認" if ok else ("待設定" if not valid else "待確認")
 
-# 狀態總覽：不要再只用小字串，直接用醒目的色塊。
 counts = {
-    "自動OK": sum(v == "自動OK" for v in status.values()),
-    "需確認": sum(v == "需確認" for v in status.values()),
-    "手動": sum(v == "手動" for v in status.values()),
+    "已確認": sum(v == "已確認" for v in status.values()),
+    "待確認": sum(v == "待確認" for v in status.values()),
+    "待設定": sum(v == "待設定" for v in status.values()),
 }
-
 b1, b2, b3 = st.columns(3)
-b1.metric("✓ 自動OK", counts["自動OK"])
-b2.metric("⚠ 需確認", counts["需確認"])
-b3.metric("✋ 手動", counts["手動"])
+b1.metric("✓ 已確認", counts["已確認"])
+b2.metric("○ 待確認", counts["待確認"])
+b3.metric("⚠ 待設定", counts["待設定"])
 
-badge_html = []
-for n in output_files_effective():
-    s = status[n.name]
-    if s == "自動OK":
-        badge_html.append(
-            f'<span style="display:inline-block;padding:5px 9px;margin:2px 4px 2px 0;'
-            f'border-radius:6px;background:#dcfce7;color:#166534;font-weight:700;">'
-            f'✓ {n.name}</span>'
-        )
-    elif s == "需確認":
-        badge_html.append(
-            f'<span style="display:inline-block;padding:6px 10px;margin:2px 4px 2px 0;'
-            f'border-radius:6px;background:#fee2e2;color:#991b1b;font-weight:800;border:1px solid #ef4444;">'
-            f'⚠ 需確認｜{n.name}</span>'
-        )
-    else:
-        badge_html.append(
-            f'<span style="display:inline-block;padding:5px 9px;margin:2px 4px 2px 0;'
-            f'border-radius:6px;background:#dbeafe;color:#1e3a8a;font-weight:700;">'
-            f'✋ 手動｜{n.name}</span>'
-        )
-st.markdown("".join(badge_html), unsafe_allow_html=True)
-
+names = [f.name for f in out_files]
 names = [f.name for f in output_files_effective()]
 if st.session_state.get("sel_photo") not in names:
     st.session_state["sel_photo"] = names[0]
@@ -333,23 +328,23 @@ sel_name = nb3.selectbox("選擇照片", names, key="sel_photo")
 sel = next(f for f in files if f.name == sel_name)
 sel_status = status[sel_name]
 
-if sel_status == "需確認":
-    st.warning("⚠ 請檢查四個紅框角點")
-elif sel_status == "手動":
-    st.info("✋ 手動角點")
+if sel_status == "待設定":
+    st.error("⚠ 找不到四個角點，請手動點四角")
+elif sel_status == "待確認":
+    st.warning("○ 請檢查這張照片的四個角點與校正結果")
 else:
-    st.success("✓ 自動完成")
+    st.success("✓ 這張已確認")
 
 out_files = output_files_effective()
 if out_files and sel.name == out_files[-1].name:
     auto_last = effective_last_rows()
     end_depth = _parse_end_depth(hole)
-    if end_depth is not None:
-        st.info(f"終深 {end_depth:g}m → 最後一箱保留 {auto_last}/{rows_per_box} 槽")
-    elif last_rows == 0:
-        st.info(f"自動：最後一箱 {auto_last}/{rows_per_box} 槽")
+    if partial_depth_m > 0:
+        st.info(f"最後一箱：{partial_depth_m:g}m → {auto_last}/{rows_per_box} 槽")
+    elif end_depth is not None:
+        st.info(f"終深 {end_depth:g}m → 最後一箱 {auto_last}/{rows_per_box} 槽")
     else:
-        st.info(f"手動：最後一箱 {int(last_rows)}/{rows_per_box} 槽")
+        st.info(f"自動判定：最後一箱 {auto_last}/{rows_per_box} 槽")
 
 r1, r2 = st.columns([1, 3])
 rot_val = r1.selectbox(
@@ -360,28 +355,47 @@ rot_val = r1.selectbox(
 )
 if rot_val != cur_rot(sel.name):
     st.session_state["rot"][sel.name] = rot_val
+    st.session_state["confirmed"].pop((sel.name, rot_val), None)
     st.rerun()
 
 img = get_img(sel)
-pts, bad, man = get_pts(sel)
+pts, failed, man = get_pts(sel)
 
 colA, colB = st.columns(2)
 with colA:
-    st.caption("原圖＋偵測四個箱內內角")
-    st.image(draw_corners(img, pts), use_container_width=True)
+    st.caption("原圖＋四個箱內內角")
+    if pts is not None:
+        st.image(draw_corners(img, pts), use_container_width=True)
+    else:
+        st.image(img, use_container_width=True)
+        st.error("目前沒有可用角點；請在下方手動點 4 個角。")
 with colB:
     st.caption("校正後（成果用）")
-    try:
-        st.image(box_image(sel), use_container_width=True)
-    except Exception as e:
-        st.error("校正預覽失敗，已避免整個頁面中斷。請重新部署 app.py + core.py。")
-        st.code(f"{type(e).__name__}: {e}")
+    if pts is not None:
+        try:
+            preview = box_image(sel)
+            st.image(preview, use_container_width=True)
+        except Exception:
+            st.error("目前無法產生校正預覽，請檢查四個角點。")
+    else:
+        st.info("設定四個角點後，這裡會顯示成果預覽。")
+
+ck = (sel.name, cur_rot(sel.name))
+confirm_value = bool(st.session_state["confirmed"].get(ck, False))
+if pts is not None:
+    confirm_value = st.checkbox(
+        "我已確認這張照片的四個角點與校正結果",
+        value=confirm_value,
+        key=f"confirm_{sel.name}_{ck[1]}",
+    )
+    st.session_state["confirmed"][ck] = bool(confirm_value)
+else:
+    st.session_state["confirmed"][ck] = False
 
 with st.expander("角點不準？手動點選箱內四個內角"):
-    st.caption("依序點：左上 → 右上 → 右下 → 左下（箱子內側四個角）。")
+    st.caption("依序點：左上 → 右上 → 右下 → 左下。")
     scale = 900 / img.shape[1]
     small = np.array(Image.fromarray(img).resize((900, int(img.shape[0] * scale))))
-    ck = (sel.name, cur_rot(sel.name))
     clicks = st.session_state["clicks"].setdefault(ck, [])
     for q in clicks:
         small[
@@ -400,24 +414,29 @@ with st.expander("角點不準？手動點選箱內四個內角"):
     if b1.button("套用手動角點", disabled=len(clicks) != 4):
         st.session_state["manual"][ck] = np.array(clicks, np.float32) / scale
         st.session_state["clicks"][ck] = []
+        st.session_state["confirmed"][ck] = False
         st.rerun()
     if b2.button("清除，回到自動"):
         st.session_state["clicks"][ck] = []
         st.session_state["manual"].pop(ck, None)
+        st.session_state["confirmed"][ck] = False
         st.rerun()
 
 # ---------------- 2. 輸出 ----------------
 st.subheader("2. 輸出成果")
 _total_rows = total_rows_effective()
 out_files = output_files_effective()
+pending = [f.name for f in out_files if not confirmed_now.get(f.name, False)]
+valid_all = all(valid_pts[f.name][1] for f in out_files) if out_files else False
+ready = bool(out_files) and valid_all and not pending
+st.write(f"輸出 {len(out_files)} 張照片 / {_total_rows} 個箱號，每頁 {per_page} 個箱號。")
+if pending:
+    st.warning(f"尚有 {len(pending)} 張照片未確認；全部確認後才能產生成果。")
 extra = max(0, len(files) - len(out_files))
-st.write(
-    f"輸出 **{len(out_files)} 張照片 / {_total_rows} 個箱號**，每頁 {per_page} 個箱號。"
-)
 if extra:
     st.info(f"已自動排除終深後的 {extra} 張照片。")
 
-if st.button("產生 Word / PDF", type="primary"):
+if st.button("產生 Word / PDF", type="primary", disabled=not ready):
     boxes, bar = [], st.progress(0.0, "處理照片中…")
     failed = None
     for i, f in enumerate(out_files):
@@ -439,7 +458,6 @@ if st.button("產生 Word / PDF", type="primary"):
             board=board_up if board_up else None, end_mark=end_mark,
             total_rows=_total_rows,
         )
-        # PDF / Word 分開輸出；其中一個失敗不會讓另一個下載按鈕變成 KeyError。
         st.session_state.pop("pdf", None)
         st.session_state.pop("docx", None)
         try:
@@ -459,17 +477,14 @@ if st.button("產生 Word / PDF", type="primary"):
 if "pdf" in st.session_state:
     d1, d2 = st.columns(2)
     d1.download_button(
-        "下載 PDF",
-        st.session_state["pdf"],
-        file_name=f"{hole}_岩心照片.pdf",
-        mime="application/pdf",
+        "下載 PDF", st.session_state["pdf"],
+        file_name=f"{hole}_岩心照片.pdf", mime="application/pdf"
     )
     if "docx" in st.session_state:
         d2.download_button(
-            "下載 Word",
-            st.session_state["docx"],
+            "下載 Word", st.session_state["docx"],
             file_name=f"{hole}_岩心照片.docx",
-            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
         )
     else:
         d2.warning("Word 尚未產生")

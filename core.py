@@ -822,13 +822,20 @@ def detect_occupied_rows(im, n=4):
     return max(1, min(int(n), k))
 
 def crop_partial(im, k, n=4, margin=MARGIN):
-    """最後一箱只有 k 列有岩心：保留前 k 槽（含其下方隔板），刪掉後面的空槽"""
+    """最後一箱只保留前 k 槽。
+
+    k 的定義就是「槽數」：每槽 1m 時，1m = 1 槽、2m = 2 槽。
+    這裡只裁掉後面的空槽，不再把保留區重新拉成滿箱高度。
+    """
     if not k or k >= n:
         return im
+    k = max(1, min(int(n), int(k)))
     mx, my = margin
     H = im.height
-    cut = (my + (1 - 2 * my) * k / n + 0.010) * H
-    return im.crop((0, 0, im.width, int(min(H, cut))))
+    # 保留成果畫布上方邊界 + k/n 的有效箱高；再帶入極小的隔板厚度，避免切到第 k 槽下緣。
+    cut_frac = my + (1.0 - 2.0 * my) * (k / float(n)) + 0.006
+    cut = int(round(min(1.0, cut_frac) * H))
+    return im.crop((0, 0, im.width, max(1, cut)))
 
 
 def draw_corners(img, pts, color=(255, 0, 0)):
@@ -901,14 +908,26 @@ def _jpeg(im, q=88):
 
 
 def _pages(boxes, rows_per_box, per_page, start_depth, row_m, total_rows=0):
-    total_rows = total_rows or len(boxes) * rows_per_box
-    bpp = per_page // rows_per_box
+    total_rows = int(total_rows or len(boxes) * rows_per_box)
+    bpp = max(1, int(per_page) // int(rows_per_box))
     for p in range(0, len(boxes), bpp):
         chunk = boxes[p:p + bpp]
-        r0 = p * rows_per_box
-        n = min(len(chunk) * rows_per_box, total_rows - r0)
+        r0 = p * int(rows_per_box)
+        n = max(0, min(len(chunk) * int(rows_per_box), total_rows - r0))
         d0 = start_depth + r0 * row_m
-        yield chunk, r0, n, f"{d0}~{d0 + n * row_m}m"
+        yield chunk, r0, n, f"{d0:g}~{d0 + n * row_m:g}m"
+
+
+def _image_height_cm(im):
+    """固定成果寬度時，依影像原始比例計算實際高度，避免再做非等比例拉伸。"""
+    return BOX_W * float(im.height) / max(1.0, float(im.width))
+
+
+def _visible_rows_for_box(total_rows, r0, box_index, rows_per_box):
+    if not total_rows:
+        return int(rows_per_box)
+    start = int(r0) + int(box_index) * int(rows_per_box)
+    return max(0, min(int(rows_per_box), int(total_rows) - start))
 
 
 # ------------------------------------------------------------------ PDF
@@ -923,21 +942,22 @@ def build_pdf(boxes, hole, date, project, start_depth=0, rows_per_box=4,
         hi = make_header(hole, depth, date, project, board)
         c.drawImage(ImageReader(_jpeg(hi, 92)), x0, y - HEADER_H * cm, HEADER_W * cm, HEADER_H * cm)
         y -= HEADER_H * cm
+        page_total = int(total_rows or len(boxes) * rows_per_box)
         for i, im in enumerate(chunk):
-            h_cm = BOX_H * (im.height * FULL_ASPECT / im.width)   # 滿箱 = BOX_H；只畫一半的箱子 = 一半高
+            h_cm = _image_height_cm(im)
             c.drawImage(ImageReader(_jpeg(im)), x0, y - h_cm * cm, BOX_W * cm, h_cm * cm)
-            c.setFont("Helvetica", 16)
-            mx_, my_ = MARGIN
-            for k in range(rows_per_box):
-                num = r0 + i * rows_per_box + k + 1
-                if total_rows and num > total_rows:
-                    break
-                frac = my_ + (1 - 2 * my_) * (k + 0.5) / rows_per_box   # 該列中心在滿箱圖中的位置
-                c.drawString(x0 + (HEADER_W + 0.3) * cm, y - BOX_H * frac * cm - 5.5, str(num))
+            visible = _visible_rows_for_box(page_total, r0, i, rows_per_box)
+            if visible:
+                c.setFont("Helvetica", 16)
+                row_h_cm = h_cm / visible
+                for k in range(visible):
+                    num = r0 + i * rows_per_box + k + 1
+                    yy = y - (k + 0.5) * row_h_cm * cm - 5.5
+                    c.drawString(x0 + (HEADER_W + 0.3) * cm, yy, str(num))
             y -= h_cm * cm
-        if r0 + n >= (total_rows or len(boxes) * rows_per_box) and end_mark:
+        if r0 + n >= page_total and end_mark:
             ti = _text_img("鑽探結束", 60)
-            if ti is not None:  # 轉成圖片，任何閱讀器都不缺字
+            if ti is not None:
                 tw = 2.6 * cm
                 c.drawImage(ImageReader(ti), W / 2 - tw / 2, y - 1.3 * cm, tw, tw * ti.height / ti.width)
             else:
@@ -988,6 +1008,7 @@ def build_docx(boxes, hole, date, project, start_depth=0, rows_per_box=4,
         pr.append(m)
 
     first = True
+    page_total = int(total_rows or len(boxes) * rows_per_box)
     for chunk, r0, n, depth in _pages(boxes, rows_per_box, per_page, start_depth, row_m, total_rows):
         sp = doc.add_paragraph()
         tight(sp, 1)
@@ -1006,32 +1027,40 @@ def build_docx(boxes, hole, date, project, start_depth=0, rows_per_box=4,
             tbl.columns[j].width = wd
             for c_ in tbl.columns[j].cells:
                 c_.width = wd
-        # 表頭列（合併兩欄）
+
         hrow = tbl.rows[0]
         hrow.height, hrow.height_rule = Cm(HEADER_H), WD_ROW_HEIGHT_RULE.EXACTLY
         hc = hrow.cells[0].merge(hrow.cells[1])
         p = hc.paragraphs[0]
         tight(p)
         hi = make_header(hole, depth, date, project, board)
-        p.add_run().add_picture(_jpeg(hi, 92), width=Cm(HEADER_W), height=Cm(HEADER_H - 0.05))
-        rh = BOX_H / rows_per_box
+        p.add_run().add_picture(_jpeg(hi, 92), width=Cm(HEADER_W), height=Cm(HEADER_H))
+
         for i, im in enumerate(chunk):
             row = tbl.rows[i + 1]
-            h_cm = BOX_H * (im.height * FULL_ASPECT / im.width)
+            h_cm = _image_height_cm(im)
             row.height, row.height_rule = Cm(h_cm), WD_ROW_HEIGHT_RULE.EXACTLY
             for j, wd in enumerate(widths):
                 row.cells[j].width = wd
+
             p = row.cells[0].paragraphs[0]
             tight(p)
-            p.add_run().add_picture(_jpeg(im), width=Cm(BOX_W), height=Cm(h_cm - 0.05))
+            # 寬與高完全按照影像本身比例，不再用 h_cm-0.05 造成輕微拉伸。
+            p.add_run().add_picture(_jpeg(im), width=Cm(BOX_W), height=Cm(h_cm))
+
             cell = row.cells[1]
-            for k in range(rows_per_box):
+            visible = _visible_rows_for_box(page_total, r0, i, rows_per_box)
+            if visible <= 0:
+                visible = 1
+            line_h = h_cm / visible / 2.54 * 72.0
+            for k in range(visible):
                 p = cell.paragraphs[0] if k == 0 else cell.add_paragraph()
-                tight(p, rh / 2.54 * 72)
+                tight(p, line_h)
                 p.alignment = WD_ALIGN_PARAGRAPH.CENTER
                 num = r0 + i * rows_per_box + k + 1
-                r = p.add_run(str(num) if (not total_rows or num <= total_rows) else "")
+                r = p.add_run(str(num))
                 r.font.size = Pt(16)
+
     if end_mark:
         p = doc.add_paragraph()
         tight(p)
