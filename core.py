@@ -105,6 +105,25 @@ def _refine_quad(pts, quad, tol_frac=0.05):
             return quad
         vx, vy, x0, y0 = cv2.fitLine(sel, cv2.DIST_HUBER, 0, 0.01, 0.01).ravel()
         lines.append((np.array([x0, y0]), np.array([vx, vy])))
+    # 左右兩邊（端壁有階梯，點位散）→ 方向限制在「垂直於上下邊」±2° 內，避免整張剪切歪斜
+    def ang(d):
+        return np.arctan2(d[1], d[0])
+
+    def lr_dir(d):  # 讓方向朝下，便於比較
+        return d if d[1] >= 0 else -d
+
+    top_d, bot_d = lines[0][1], lines[2][1]
+    top_d = top_d if top_d[0] >= 0 else -top_d
+    bot_d = bot_d if bot_d[0] >= 0 else -bot_d
+    base = np.arctan2(top_d[1] + bot_d[1], top_d[0] + bot_d[0])  # 上下邊平均方向
+    perp = base + np.pi / 2
+    for idx in (1, 3):
+        p0, d0 = lines[idx]
+        d0 = lr_dir(d0)
+        delta = (ang(d0) - perp + np.pi) % (2 * np.pi) - np.pi
+        delta = float(np.clip(delta, -np.deg2rad(2.0), np.deg2rad(2.0)))
+        a2 = perp + delta
+        lines[idx] = (p0, np.array([np.cos(a2), np.sin(a2)]))
     out = []
     for i in range(4):
         p1, d1 = lines[(i - 1) % 4]
@@ -120,13 +139,25 @@ def _refine_quad(pts, quad, tol_frac=0.05):
     return out
 
 
+def _extend_missing(quad, full_aspect=3.1, thr=1.25):
+    """整箱 4 槽的內框寬高比約 3.1。若量到的框比這扁很多，代表下面幾槽是空的（藍色槽底
+    不會形成洞，沒被偵測到），依岩心由上往下放的慣例把框往下補足，不要把 2 槽硬拉成 4 槽。"""
+    tl, tr, br, bl = quad
+    w = (np.linalg.norm(tr - tl) + np.linalg.norm(br - bl)) / 2
+    h = (np.linalg.norm(bl - tl) + np.linalg.norm(br - tr)) / 2
+    if h <= 0 or w / h < full_aspect * thr:
+        return quad
+    k = (w / full_aspect - h) / h
+    return np.array([tl, tr, br + (br - tr) * k, bl + (bl - tl) * k], np.float32)
+
+
 def _blue_mask(sm):
     hsv = cv2.cvtColor(sm, cv2.COLOR_RGB2HSV)
     mask = cv2.inRange(hsv, (85, 80, 60), (118, 255, 255))
     return cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
 
 
-def detect_inner(img):
+def detect_inner(img, full_aspect=3.1):
     """找「岩心所在的那一格」＝藍色岩心箱內側的四個內角（橘框）。
     做法：藍色箱壁/隔板會圍出 4 個「洞」（每個洞 = 一條岩心槽），
     把這幾個洞合起來取外框，再縮成 4 個角。腳、土、旁邊的箱子不會形成這種洞，所以不受影響。
@@ -161,8 +192,10 @@ def detect_inner(img):
     hull = cv2.convexHull(np.vstack(grp))
     quad = _extreme_quad(hull)
     quad = _refine_quad(np.vstack([c.reshape(-1, 2) for c in grp]), quad)
+    quad = order_pts(quad)
+    quad = _extend_missing(quad, full_aspect)
     area = cv2.contourArea(quad)
-    bad = (len(grp) < 3) or area < 0.05 * sh * sw
+    bad = area < 0.05 * sh * sw
     bad = bad or bool(np.any(quad < 2) or np.any(quad[:, 0] > sw - 3) or np.any(quad[:, 1] > sh - 3))
     return order_pts(quad / sc), bool(bad)
 
@@ -198,7 +231,7 @@ def _crop_to_rim(img, inner, shrink=0.003):
             n += 1
         return i
 
-    capx, capy = int(w2 * 0.045), int(h2 * 0.075)
+    capx, capy = int(w2 * 0.06), int(h2 * 0.11)
     xl = walk(colf, x0, -1, capx)
     xr = walk(colf, x1, +1, capx)
     yt = walk(rowf, y0, -1, capy)
@@ -215,7 +248,13 @@ def warp_inner(img, pts, out_w=2400, aspect=3.1, shrink=0.003):
     ch = int(cw / 2.9)
     w1 = _warp_to(img, pts, cw, ch, big)
     p2, bad2 = detect_inner(w1)
-    w2 = _warp_to(w1, p2, cw, ch, big) if (p2 is not None and not bad2) else w1
+    ok2 = False
+    if p2 is not None and not bad2:
+        l, r, t, b = big
+        exp = np.array([[cw * l, ch * t], [cw * (1 - r), ch * t],
+                        [cw * (1 - r), ch * (1 - b)], [cw * l, ch * (1 - b)]], np.float32)
+        ok2 = bool(np.abs(order_pts(p2) - exp).max() < 0.035 * cw)  # 偏離太多＝第二段偵測錯，不採用
+    w2 = _warp_to(w1, p2, cw, ch, big) if ok2 else w1
     crop = _crop_to_rim(w2, big, shrink)
     oh = int(out_w / aspect)
     return cv2.resize(crop, (out_w, oh), interpolation=cv2.INTER_AREA)
@@ -223,7 +262,7 @@ def warp_inner(img, pts, out_w=2400, aspect=3.1, shrink=0.003):
 
 def draw_corners(img, pts, color=(255, 0, 0)):
     out = img.copy()
-    p = np.array(pts, np.int32)
+    p = order_pts(pts).astype(np.int32)
     t = max(3, img.shape[1] // 300)
     cv2.polylines(out, [p.reshape(-1, 1, 2)], True, color, t)
     for q in p:
@@ -272,6 +311,17 @@ def make_header(hole, depth, date, project, board=None):
     return im
 
 
+def _text_img(text, size):
+    fp = next((p for p in SERIF_PATHS if os.path.exists(p)), None)
+    if not fp:
+        return None
+    f = _font(size)
+    bb = ImageDraw.Draw(Image.new("RGB", (1, 1))).textbbox((0, 0), text, font=f)
+    im = Image.new("RGB", (bb[2] - bb[0] + 20, bb[3] - bb[1] + 20), "white")
+    ImageDraw.Draw(im).text((10 - bb[0], 10 - bb[1]), text, font=f, fill="black")
+    return im
+
+
 def _jpeg(im, q=88):
     b = io.BytesIO()
     im.convert("RGB").save(b, "JPEG", quality=q)
@@ -279,24 +329,25 @@ def _jpeg(im, q=88):
     return b
 
 
-def _pages(boxes, rows_per_box, per_page, start_depth, row_m):
+def _pages(boxes, rows_per_box, per_page, start_depth, row_m, total_rows=0):
+    total_rows = total_rows or len(boxes) * rows_per_box
     bpp = per_page // rows_per_box
     for p in range(0, len(boxes), bpp):
         chunk = boxes[p:p + bpp]
         r0 = p * rows_per_box
-        n = len(chunk) * rows_per_box
+        n = min(len(chunk) * rows_per_box, total_rows - r0)
         d0 = start_depth + r0 * row_m
         yield chunk, r0, n, f"{d0}~{d0 + n * row_m}m"
 
 
 # ------------------------------------------------------------------ PDF
 def build_pdf(boxes, hole, date, project, start_depth=0, rows_per_box=4,
-              per_page=20, row_m=1, board=None, end_mark=True):
+              per_page=20, row_m=1, board=None, end_mark=True, total_rows=0):
     buf = io.BytesIO()
     c = canvas.Canvas(buf, pagesize=A4)
     W, H = A4
     x0 = PAGE_MX * cm
-    for chunk, r0, n, depth in _pages(boxes, rows_per_box, per_page, start_depth, row_m):
+    for chunk, r0, n, depth in _pages(boxes, rows_per_box, per_page, start_depth, row_m, total_rows):
         y = H - PAGE_MY * cm
         hi = make_header(hole, depth, date, project, board)
         c.drawImage(ImageReader(_jpeg(hi, 92)), x0, y - HEADER_H * cm, HEADER_W * cm, HEADER_H * cm)
@@ -307,11 +358,18 @@ def build_pdf(boxes, hole, date, project, start_depth=0, rows_per_box=4,
             c.setFont("Helvetica", 16)
             for k in range(rows_per_box):
                 num = r0 + i * rows_per_box + k + 1
+                if total_rows and num > total_rows:
+                    break
                 c.drawString(x0 + (HEADER_W + 0.3) * cm, y - (k + 0.5) * rh - 5.5, str(num))
             y -= BOX_H * cm
-        if r0 + n >= len(boxes) * rows_per_box and end_mark:
-            c.setFont("MSung-Light", 10.5)
-            c.drawCentredString(W / 2, y - 0.8 * cm, "鑽探結束")
+        if r0 + n >= (total_rows or len(boxes) * rows_per_box) and end_mark:
+            ti = _text_img("鑽探結束", 60)
+            if ti is not None:  # 轉成圖片，任何閱讀器都不缺字
+                tw = 2.6 * cm
+                c.drawImage(ImageReader(ti), W / 2 - tw / 2, y - 1.3 * cm, tw, tw * ti.height / ti.width)
+            else:
+                c.setFont("MSung-Light", 10.5)
+                c.drawCentredString(W / 2, y - 0.8 * cm, "鑽探結束")
         c.showPage()
     c.save()
     return buf.getvalue()
@@ -319,7 +377,7 @@ def build_pdf(boxes, hole, date, project, start_depth=0, rows_per_box=4,
 
 # ------------------------------------------------------------------ Word
 def build_docx(boxes, hole, date, project, start_depth=0, rows_per_box=4,
-               per_page=20, row_m=1, board=None, end_mark=True):
+               per_page=20, row_m=1, board=None, end_mark=True, total_rows=0):
     from docx import Document
     from docx.enum.table import WD_ROW_HEIGHT_RULE
     from docx.enum.text import WD_LINE_SPACING, WD_ALIGN_PARAGRAPH
@@ -357,7 +415,7 @@ def build_docx(boxes, hole, date, project, start_depth=0, rows_per_box=4,
         pr.append(m)
 
     first = True
-    for chunk, r0, n, depth in _pages(boxes, rows_per_box, per_page, start_depth, row_m):
+    for chunk, r0, n, depth in _pages(boxes, rows_per_box, per_page, start_depth, row_m, total_rows):
         sp = doc.add_paragraph()
         tight(sp, 1)
         sp.add_run("").font.size = Pt(1)
@@ -397,7 +455,8 @@ def build_docx(boxes, hole, date, project, start_depth=0, rows_per_box=4,
                 p = cell.paragraphs[0] if k == 0 else cell.add_paragraph()
                 tight(p, rh / 2.54 * 72)
                 p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                r = p.add_run(str(r0 + i * rows_per_box + k + 1))
+                num = r0 + i * rows_per_box + k + 1
+                r = p.add_run(str(num) if (not total_rows or num <= total_rows) else "")
                 r.font.size = Pt(16)
     if end_mark:
         p = doc.add_paragraph()
