@@ -20,6 +20,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 # ---- 版面（依範例 Word 量測：A4、左右 2cm、上下 1cm）----
 PAGE_MX, PAGE_MY = 2.0, 1.0
+DETECTOR_VERSION = "2.5-full-tray"
 HEADER_W, HEADER_H = 15.4, 3.17
 BOX_W, BOX_H = 15.15, 4.85
 NUM_COL_W = 1.0
@@ -688,8 +689,8 @@ def _finish_full_tray_quad(p, full_aspect=3.1):
         return q
 
     # 只有當量到的框明顯「太扁」時，才視為少抓了下面的槽。
-    # 3.7 對應約 4 槽箱 3.1 的 +19%，可容忍一般照片的透視誤差。
-    if w / h <= full_aspect * 1.19:
+    # 1.08 倍門檻：只有明顯「過扁、疑似只抓到前幾槽」時才向下補回完整四槽箱體；一般歪斜不會被誤補。
+    if w / h <= full_aspect * 1.08:
         return q
 
     # 沿左、右邊方向只向下補，保持上方四角不動。
