@@ -5,11 +5,11 @@ import streamlit as st
 from PIL import Image
 from streamlit_image_coordinates import streamlit_image_coordinates
 
-from core import (natural_key, load_image, rotate_extra, detect_inner, warp_inner,
-                  draw_corners, build_pdf, build_docx)
+from core import (natural_key, load_image, rotate_extra, detect_inner, warp_points,
+                  crop_partial, draw_corners, build_pdf, build_docx)
 
 st.set_page_config(page_title="岩心照片校正與成果輸出", layout="wide")
-st.title("岩心箱照片：轉橫 → 以岩心箱校正 → 套疊成果（Word / PDF）")
+st.title("岩心箱照片：轉橫 → 以箱內四個內角校正 → 套疊成果（Word / PDF）")
 
 # ---------------- 側邊欄 ----------------
 with st.sidebar:
@@ -24,15 +24,17 @@ with st.sidebar:
     portrait_dir = st.radio("直式照片（90°拍攝）轉橫的方向", ["逆時針", "順時針"], horizontal=True)
     st.caption("轉橫後標籤 H25-1B 應在箱子上緣右側、箱號 1–4 在右邊且由上往下。若相反，在下方用「額外旋轉」單張修正。")
     global_rot = st.selectbox("全部照片額外旋轉（逆時針）", [0, 90, 180, 270], index=0)
-    aspect = st.number_input("成果圖整箱 寬/高（範例 Word ≈ 3.1）", 1.5, 5.0, 3.1, 0.01)
+    aspect = st.number_input("成果圖整箱 寬/高（範例 Word ≈ 3.12）", 1.5, 5.0, 3.12, 0.01)
 
     st.header("成果裁切")
-    shrink = st.slider("箱子外緣再內縮 %", 0.0, 3.0, 0.3, 0.1) / 100
+    st.caption("成果圖 = 箱內四個內角拉成長方形，外側只多留一點點邊（同範例 Word 的裁法）。")
+    mgx = st.slider("左右多留 %", 0.0, 3.0, 0.4, 0.1) / 100
+    mgy = st.slider("上下多留 %", 0.0, 3.0, 0.6, 0.1) / 100
     rows_per_box = st.number_input("每箱列數", 1, 10, 4)
     row_m = st.number_input("每列代表深度 (m)", 1, 5, 1)
     per_page = st.number_input("每頁箱號數", 4, 40, 20, 4)
     last_rows = st.number_input("最後一箱實際有岩心的列數（0 = 滿箱）", 0, 10, 0,
-                                help="例：只鑽到 50m，最後一箱只有 49、50 兩列 → 填 2。照片仍保留整個箱子，箱號只標到 50。")
+                                help="例：只鑽到 50m，最後一箱只有 49、50 兩列 → 填 2。照片會只保留前 2 槽，後面的空槽和箱號 51、52 都刪除。")
     end_mark = st.checkbox("最後加「鑽探結束」", True)
     skip_warp = st.checkbox("照片已是正的，不做透視校正", False)
 
@@ -83,8 +85,11 @@ def box_image(f):
     img = get_img(f)
     if not skip_warp:
         pts, _, _ = get_pts(f)
-        img = warp_inner(img, pts, aspect=aspect, shrink=shrink)
-    return Image.fromarray(img)
+        img = warp_points(img, pts, aspect=aspect, margin=(mgx, mgy))
+    im = Image.fromarray(img)
+    if last_rows and f.name == files[-1].name:       # 最後一箱：只留有岩心的槽
+        im = crop_partial(im, last_rows, rows_per_box, (mgx, mgy))
+    return im
 
 
 # ---------------- 1. 逐張檢查 ----------------
@@ -95,8 +100,22 @@ for f in files:
     status[f.name] = "手動" if man else ("⚠ 需確認" if bad else "自動OK")
 st.caption("狀態：" + "　".join(f"{n}：{s}" for n, s in status.items()))
 
-sel_name = st.selectbox("選擇照片", [f.name for f in files],
-                        format_func=lambda n: f"{n}　[{status[n]}]")
+names = [f.name for f in files]
+if st.session_state.get("sel_photo") not in names:
+    st.session_state["sel_photo"] = names[0]
+
+
+def _step(d):
+    k = names.index(st.session_state["sel_photo"]) + d
+    st.session_state["sel_photo"] = names[max(0, min(len(names) - 1, k))]
+
+
+nb1, nb2, nb3 = st.columns([1, 1, 6])
+nb1.button("◀ 上一張", on_click=_step, args=(-1,))
+nb2.button("下一張 ▶", on_click=_step, args=(1,))
+# 選項文字固定（不放狀態），否則狀態一變 widget 會被當成新的而跳回第一張
+sel_name = nb3.selectbox("選擇照片", names, key="sel_photo")
+st.caption(f"目前這張：{status[sel_name]}")
 sel = next(f for f in files if f.name == sel_name)
 
 r1, r2 = st.columns([1, 3])
@@ -109,18 +128,18 @@ if rot_val != cur_rot(sel.name):
 img = get_img(sel)
 pts, bad, man = get_pts(sel)
 if bad and not man:
-    r2.warning("自動偵測的內角不可靠（找不到 4 條岩心槽或貼近照片邊緣），請檢查紅框；不準就用下方手動點四角。")
+    r2.warning("自動偵測的四個內角不可靠（找不到岩心槽或貼近照片邊緣），請檢查紅框；不準就用下方手動點四個內角。")
 
 colA, colB = st.columns(2)
 with colA:
-    st.caption("已轉橫的原圖與偵測到的「岩心所在格」四個內角（紅框）")
+    st.caption("已轉橫的原圖與箱內四個內角（紅框，與你手點的定義相同）")
     st.image(draw_corners(img, pts), use_container_width=True)
 with colB:
-    st.caption("校正後（成果用，已裁到箱子外緣）")
+    st.caption("校正後（成果用）")
     st.image(box_image(sel), use_container_width=True)
 
-with st.expander("角點不準？手動點選岩心槽四個內角"):
-    st.caption("依序點：左上 → 右上 → 右下 → 左下（只點岩心所在那一格的內側四角，即隔板圍出的整片槽區）。")
+with st.expander("角點不準？手動點選箱內四個內角"):
+    st.caption("依序點：左上 → 右上 → 右下 → 左下（箱子內側的四個角，藍色箱緣內緣）。")
     scale = 900 / img.shape[1]
     small = np.array(Image.fromarray(img).resize((900, int(img.shape[0] * scale))))
     ck = (sel.name, cur_rot(sel.name))
