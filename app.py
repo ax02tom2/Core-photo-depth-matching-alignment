@@ -58,25 +58,20 @@ for k in ("manual", "clicks", "rot"):
     st.session_state.setdefault(k, {})
 pdir = "ccw" if portrait_dir == "逆時針" else "cw"
 
-
 @st.cache_data(show_spinner=False, max_entries=60)
 def _load(name, data, pdir):
     return load_image(io.BytesIO(data), portrait_dir=pdir)
-
 
 @st.cache_data(show_spinner=False, max_entries=120)
 def _detect(name, data, pdir, rot, inset_adj):
     img = rotate_extra(_load(name, data, pdir), rot)
     return detect_inner(img, inset_adj=inset_adj)
 
-
 def cur_rot(name):
     return st.session_state["rot"].get(name, global_rot)
 
-
 def get_img(f):
     return rotate_extra(_load(f.name, f.getvalue(), pdir), cur_rot(f.name))
-
 
 def get_pts(f):
     key = (f.name, cur_rot(f.name))
@@ -88,7 +83,6 @@ def get_pts(f):
         h, w = img.shape[:2]
         return np.array([[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]], np.float32), True, False
     return p, bad, False
-
 
 def box_image(f):
     img = get_img(f)
@@ -105,7 +99,6 @@ def box_image(f):
             im = crop_partial(im, last_rows, rows_per_box, (mgx, mgy))
             
     return im
-
 
 # ---------------- 1. 逐張檢查與自動判視 ----------------
 st.subheader("1. 檢查每張照片的校正結果")
@@ -134,11 +127,9 @@ names = [f.name for f in files]
 if st.session_state.get("sel_photo") not in names:
     st.session_state["sel_photo"] = names[0]
 
-
 def _step(d):
     k = names.index(st.session_state["sel_photo"]) + d
     st.session_state["sel_photo"] = names[max(0, min(len(names) - 1, k))]
-
 
 nb1, nb2, nb3 = st.columns([1, 1, 6])
 nb1.button("◀ 上一張", on_click=_step, args=(-1,))
@@ -191,7 +182,6 @@ with st.expander("角點不準？手動點選箱內四個內角"):
         st.session_state["manual"].pop(ck, None)
         st.rerun()
 
-
 # ---------------- 2. 輸出 ----------------
 st.subheader("2. 輸出成果（版面同範例 Word）")
 st.write(f"設定總頁數排版，每頁 {per_page} 個箱號。")
@@ -199,7 +189,6 @@ st.write(f"設定總頁數排版，每頁 {per_page} 個箱號。")
 if st.button("產生 Word / PDF", type="primary"):
     boxes, bar = [], st.progress(0.0, "處理照片中…")
     
-    # 確保資料型態為整數，避免 TypeError 崩潰
     actual_last_rows = int(last_rows)
     if auto_last:
         last_img_raw = get_img(files[-1])
