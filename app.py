@@ -6,7 +6,7 @@ from PIL import Image
 from streamlit_image_coordinates import streamlit_image_coordinates
 
 from core import (natural_key, load_image, rotate_extra, detect_inner, warp_points,
-                  crop_partial, draw_corners, build_pdf, build_docx)
+                  crop_partial, count_filled_channels, draw_corners, build_pdf, build_docx)
 
 st.set_page_config(page_title="岩心照片校正與成果輸出", layout="wide")
 st.title("岩心箱照片：轉橫 → 以箱內四個內角校正 → 套疊成果（Word / PDF）")
@@ -30,17 +30,13 @@ with st.sidebar:
     st.caption("成果圖 = 箱內四個內角拉成長方形，外側只多留一點點邊（同範例 Word 的裁法）。")
     mgx = st.slider("左右多留 %", 0.0, 3.0, 0.4, 0.1) / 100
     mgy = st.slider("上下多留 %", 0.0, 3.0, 0.6, 0.1) / 100
-    source_pad = st.slider(
-        "內角向箱外安全外擴 %", 0.0, 2.0, 0.6, 0.1,
-        help="角點先往箱外微擴，避免剛好壓在岩心邊緣而切到岩心。"
-    ) / 100
     rows_per_box = st.number_input("每箱列數", 1, 10, 4)
     row_m = st.number_input("每列代表深度 (m)", 1, 5, 1)
     per_page = st.number_input("每頁箱號數", 4, 40, 20, 4)
-    last_rows = st.number_input(
-        "最後一箱實際有岩心的列數（0 = 自動判定）", 0, 10, 0,
-        help="預設自動判斷最後一張照片有幾槽岩心。若自動結果不對，再手動輸入 1～4 覆寫。"
-    )
+    last_choice = st.selectbox("最後一箱有岩心的列數", ["自動判定", 1, 2, 3, 4],
+                               help="自動判定：看最後一箱每一槽是不是只有藍色槽底（空槽）。"
+                                    "例：只鑽到 50m → 49、50 有岩心，後面空槽與箱號 51、52 會自動刪除。"
+                                    "判定不對時可手動指定。")
     end_mark = st.checkbox("最後加「鑽探結束」", True)
     skip_warp = st.checkbox("照片已是正的，不做透視校正", False)
 
@@ -87,29 +83,28 @@ def get_pts(f):
     return p, touch, False
 
 
-def effective_last_rows():
-    """最後一張照片的實際岩心列數：手動覆寫 > 自動判定。"""
-    if last_rows:
-        return min(int(last_rows), int(rows_per_box))
-    last = files[-1]
-    img = get_img(last)
-    if not skip_warp:
-        pts, _, _ = get_pts(last)
-        img = warp_points(img, pts, aspect=aspect, margin=(mgx, mgy), source_pad=source_pad)
-    return int(detect_occupied_rows(img, rows_per_box))
-
-
-def box_image(f):
+def rect_raw(f):
     img = get_img(f)
     if not skip_warp:
         pts, _, _ = get_pts(f)
-        img = warp_points(img, pts, aspect=aspect, margin=(mgx, mgy), source_pad=source_pad)
-    im = Image.fromarray(img)
-    if f.name == files[-1].name:
-        k = effective_last_rows()
-        if k < rows_per_box:
-            im = crop_partial(im, k, rows_per_box, (mgx, mgy))
+        img = warp_points(img, pts, aspect=aspect, margin=(mgx, mgy))
+    return Image.fromarray(img)
+
+
+def box_image(f):
+    im = rect_raw(f)
+    if last_rows and f.name == files[-1].name:       # 最後一箱：只留有岩心的槽
+        im = crop_partial(im, last_rows, rows_per_box, (mgx, mgy))
     return im
+
+
+# 最後一箱有幾列有岩心（0 = 滿箱）
+if last_choice == "自動判定":
+    _k = count_filled_channels(np.array(rect_raw(files[-1])), rows_per_box, (mgx, mgy))
+else:
+    _k = int(last_choice)
+last_rows = _k if _k < rows_per_box else 0
+total_rows = ((len(files) - 1) * rows_per_box + last_rows) if last_rows else len(files) * rows_per_box
 
 
 # ---------------- 1. 逐張檢查 ----------------
@@ -137,9 +132,6 @@ nb2.button("下一張 ▶", on_click=_step, args=(1,))
 sel_name = nb3.selectbox("選擇照片", names, key="sel_photo")
 st.caption(f"目前這張：{status[sel_name]}")
 sel = next(f for f in files if f.name == sel_name)
-if sel.name == files[-1].name and last_rows == 0:
-    _last_auto = effective_last_rows()
-    st.caption(f"最後一箱自動判定：{_last_auto}/{rows_per_box} 槽有岩心；若判斷不對，可在左側輸入 1～{rows_per_box} 覆寫。")
 
 r1, r2 = st.columns([1, 3])
 rot_val = r1.selectbox("此張額外旋轉（逆時針）", [0, 90, 180, 270],
@@ -185,8 +177,10 @@ with st.expander("角點不準？手動點選箱內四個內角"):
 
 # ---------------- 2. 輸出 ----------------
 st.subheader("2. 輸出成果（版面同範例 Word）")
-st.write(f"共 {len(files)} 張照片 → {((len(files) - 1) * rows_per_box + last_rows) if last_rows else len(files) * rows_per_box} 個箱號，"
-         f"每頁 {per_page} 個箱號。")
+st.write(f"共 {len(files)} 張照片 → {total_rows} 個箱號，每頁 {per_page} 個箱號。")
+if last_rows:
+    st.info(f"最後一箱（{files[-1].name}）判定只有前 {last_rows} 列有岩心：後面的空槽會刪除，"
+            f"箱號只到 {total_rows}（深度到 {start_depth + total_rows * row_m} m）。判定不對可在側邊欄手動指定。")
 if st.button("產生 Word / PDF", type="primary"):
     boxes, bar = [], st.progress(0.0, "處理照片中…")
     for i, f in enumerate(files):
@@ -195,7 +189,7 @@ if st.button("產生 Word / PDF", type="primary"):
     kw = dict(hole=hole, date=date, project=project, start_depth=start_depth,
               rows_per_box=rows_per_box, per_page=per_page, row_m=row_m,
               board=board_up if board_up else None, end_mark=end_mark,
-              total_rows=_total_rows)
+              total_rows=total_rows if last_rows else 0)
     st.session_state["pdf"] = build_pdf(boxes, **kw)
     st.session_state["docx"] = build_docx(boxes, **kw)
     bar.empty()

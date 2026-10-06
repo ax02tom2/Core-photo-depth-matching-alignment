@@ -254,9 +254,9 @@ def _fit_line_robust(pts):
     return np.array([x0, y0]), np.array([vx, vy])
 
 
-def _outer_quad(w, big):
-    """在（已大致拉正的）圖上，沿藍色箱緣找出箱子最外緣四條邊，再取交點。
-    外緣是長直線，比端壁階梯、隔板的內角穩定，所以歪斜可以在這裡一次修正。"""
+def _outer_lines(w, big):
+    """在（已大致拉正的）圖上，沿藍色箱緣找出箱子最外緣的四條邊（上、右、下、左，各為 點+方向，
+    找不到的邊為 None）。外緣是長直線，比端壁階梯、隔板的內角穩定。"""
     h, wd = w.shape[:2]
     hsv = cv2.cvtColor(cv2.resize(w, (wd // 2, h // 2)), cv2.COLOR_RGB2HSV)
     m = cv2.inRange(hsv, (85, 70, 50), (118, 255, 255)) > 0
@@ -280,266 +280,136 @@ def _outer_quad(w, big):
         a = _walk_out(m[:, x], y1, +1, capy)
         if a is not None:
             B.append((x, a))
-    lines = [_fit_line_robust(T), _fit_line_robust(R), _fit_line_robust(B), _fit_line_robust(L)]
-    if any(ln is None for ln in lines):
-        return None
-    q = []
-    for i in range(4):
-        p1, d1 = lines[(i - 1) % 4]
-        p2, d2 = lines[i]
-        A = np.array([d1, -d2]).T
-        if abs(np.linalg.det(A)) < 1e-6:
-            return None
-        tt = np.linalg.solve(A, p2 - p1)
-        q.append(p1 + tt[0] * d1)
-    return np.array(q, np.float32) * 2
-
-
-def _inner_quad_from_blue(w1, outer_q, expected=TRAY_INSET):
-    """直接找藍色箱壁「外側到內側」的第一個藍色帶之內緣。
-
-    TRAY_INSET 只用來限制搜尋位置；最後角點由藍色箱壁的實際內緣決定。
-    由外往內掃描並取藍色帶的最後一個像素，可避免把箱內的藍色反光/
-    隔板誤當成岩心槽內角。
-    """
-    h, w = w1.shape[:2]
-    hsv = cv2.cvtColor(w1, cv2.COLOR_RGB2HSV)
-    blue = cv2.inRange(hsv, (85, 70, 50), (118, 255, 255)) > 0
-
-    tl, tr, br, bl = outer_q
-    xmin, xmax = sorted((float(tl[0]), float(tr[0])))
-    ymin, ymax = sorted((float(tl[1]), float(bl[1])))
-    fl, fr, ft, fb = expected
-
-    ex_t = (tl[1] + tr[1]) / 2 + ft * ((bl[1] + br[1] - tl[1] - tr[1]) / 2)
-    ex_b = (bl[1] + br[1]) / 2 - fb * ((bl[1] + br[1] - tl[1] - tr[1]) / 2)
-    ex_l = (tl[0] + bl[0]) / 2 + fl * ((tr[0] + br[0] - tl[0] - bl[0]) / 2)
-    ex_r = (tr[0] + br[0]) / 2 - fr * ((tr[0] + br[0] - tl[0] - bl[0]) / 2)
-
-    def last_of_first_blue_run(line, start, stop, step):
-        i = int(start)
-        stop = int(stop)
-        while 0 <= i < len(line) and ((i <= stop) if step > 0 else (i >= stop)):
-            if line[i]:
-                # 沿「外 -> 內」走完整個藍色箱壁，取最後一點 = 內緣。
-                while 0 <= i + step < len(line) and (
-                    (i + step <= stop) if step > 0 else (i + step >= stop)
-                ) and line[i + step]:
-                    i += step
-                return i
-            i += step
-        return None
-
-    search = 0.10
-    tol = 0.11
-    top, right, bottom, left = [], [], [], []
-
-    # 上/下：由外框往箱內掃。
-    for x in np.linspace(xmin + .10 * (xmax - xmin),
-                          xmax - .10 * (xmax - xmin), 140).astype(int):
-        y = last_of_first_blue_run(blue[:, x], ymin + 2, ex_t + search * h, +1)
-        if y is not None and abs(y - ex_t) <= tol * h:
-            top.append((x, y))
-
-        y = last_of_first_blue_run(blue[:, x], ymax - 2, ex_b - search * h, -1)
-        if y is not None and abs(y - ex_b) <= tol * h:
-            bottom.append((x, y))
-
-    # 左/右：由外框往箱內掃。
-    for y in np.linspace(ymin + .12 * (ymax - ymin),
-                         ymax - .12 * (ymax - ymin), 140).astype(int):
-        x = last_of_first_blue_run(blue[y, :], xmin + 2, ex_l + search * w, +1)
-        if x is not None and abs(x - ex_l) <= tol * w:
-            left.append((x, y))
-
-        x = last_of_first_blue_run(blue[y, :], xmax - 2, ex_r - search * w, -1)
-        if x is not None and abs(x - ex_r) <= tol * w:
-            right.append((x, y))
-
-    lines = [_fit_line_robust(top), _fit_line_robust(right),
-             _fit_line_robust(bottom), _fit_line_robust(left)]
-    if any(x is None for x in lines):
-        return None
-
     out = []
-    for i in range(4):
-        p1, d1 = lines[(i - 1) % 4]
-        p2, d2 = lines[i]
-        A = np.array([d1, -d2]).T
-        if abs(np.linalg.det(A)) < 1e-6:
-            return None
-        t = np.linalg.solve(A, p2 - p1)
-        out.append(p1 + t[0] * d1)
+    for pts in (T, R, B, L):
+        ln = _fit_line_robust(pts)
+        out.append(None if ln is None else (ln[0] * 2, ln[1]))
+    return out
 
-    q = order_pts(np.array(out, np.float32))
-    ew = (np.linalg.norm(q[1] - q[0]) + np.linalg.norm(q[2] - q[3])) / 2
-    eh = (np.linalg.norm(q[3] - q[0]) + np.linalg.norm(q[2] - q[1])) / 2
-    ow = (np.linalg.norm(outer_q[1] - outer_q[0]) +
-          np.linalg.norm(outer_q[2] - outer_q[3])) / 2
-    oh = (np.linalg.norm(outer_q[3] - outer_q[0]) +
-          np.linalg.norm(outer_q[2] - outer_q[1])) / 2
-    if not (0.70 * ow < ew < 0.99 * ow and 0.65 * oh < eh < 0.99 * oh):
-        return None
-    if np.any(q[:, 0] < xmin) or np.any(q[:, 0] > xmax):
-        return None
-    if np.any(q[:, 1] < ymin) or np.any(q[:, 1] > ymax):
-        return None
-    return q
+
+# 外緣各邊相對「岩心槽範圍（洞）」的典型距離（佔洞範圍寬/高的比例），由多張照片量得：
+# 左 6.6%、右 7.0%、上 11.5%、下 9.7%；各邊只接受落在合理範圍內的擬合結果
+EXPECT = {"L": 0.066, "R": 0.070, "T": 0.115, "B": 0.097}
+VALID = {"L": (0.025, 0.10), "R": (0.025, 0.10), "T": (0.06, 0.185), "B": (0.06, 0.15)}
+
+
+def _side_ok(side, ln, x0, x1, y0, y1):
+    """檢查某一邊的擬合直線：距離在合理範圍、方向接近水平/垂直（旁邊的箱蓋、雜物會讓某一邊離譜）"""
+    if ln is None:
+        return False
+    p, d = ln
+    W, H = x1 - x0, y1 - y0
+    horiz = side in ("T", "B")
+    ang = np.degrees(np.arctan2(d[1], d[0])) % 180
+    dev = min(ang, 180 - ang) if horiz else abs(ang - 90)
+    if dev > 6:
+        return False
+    if horiz:
+        yl = p[1] + d[1] / (d[0] if abs(d[0]) > 1e-9 else 1e-9) * ((x0 + x1) / 2 - p[0])
+        off = (y0 - yl) / H if side == "T" else (yl - y1) / H
+    else:
+        xl = p[0] + d[0] / (d[1] if abs(d[1]) > 1e-9 else 1e-9) * ((y0 + y1) / 2 - p[1])
+        off = (x0 - xl) / W if side == "L" else (xl - x1) / W
+    lo, hi = VALID[side]
+    return lo <= off <= hi
 
 
 def detect_inner(img, full_aspect=3.1):
-    """自動找出「岩心箱內側四角」。
-
-    流程：
-    1) 以岩心槽粗略定位箱子；
-    2) 透視拉正後，以藍色箱壁的「內側邊界」直接擬合四條線；
-    3) 四線交點就是內角，再轉回原圖。
-
-    TRAY_INSET 只作為搜尋範圍，不再直接決定最後角點。
-    若內緣偵測失敗，才退回舊方法，並標記 bad=True。
-    """
+    """自動找出「岩心箱內側四角」（與使用者手點的四個點同一定義）。
+    1) 先用岩心槽（藍色隔板圍出的洞）粗略拉正；
+    2) 在拉正圖上找藍色箱緣最外側四條邊 → 外框四角（直線擬合，抗歪斜）；
+    3) 外框依固定比例（TRAY_INSET）內縮 → 內側四角，再轉回原圖座標。
+    回傳 (pts, bad)；bad=True 表示不可靠，請手動點。"""
     ph, bad = _detect_holes(img, full_aspect)
     if ph is None:
         return None, True
-
     cw = 2400
     ch = int(cw / 2.9)
     big = (0.07, 0.07, 0.14, 0.14)
     l, r, t, b = big
-    dst = np.array([
-        [cw * l, ch * t],
-        [cw * (1 - r), ch * t],
-        [cw * (1 - r), ch * (1 - b)],
-        [cw * l, ch * (1 - b)]
-    ], np.float32)
-
+    dst = np.array([[cw * l, ch * t], [cw * (1 - r), ch * t],
+                    [cw * (1 - r), ch * (1 - b)], [cw * l, ch * (1 - b)]], np.float32)
     M1 = cv2.getPerspectiveTransform(order_pts(ph), dst)
-    w1 = cv2.warpPerspective(
-        img, M1, (cw, ch), flags=cv2.INTER_LINEAR,
-        borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0)
-    )
-
-    oq = _outer_quad(w1, big)
-    if oq is None:
-        return ph, True
-
-    ow = (np.linalg.norm(oq[1] - oq[0]) + np.linalg.norm(oq[2] - oq[3])) / 2
-    oh = (np.linalg.norm(oq[3] - oq[0]) + np.linalg.norm(oq[2] - oq[1])) / 2
-    inner_w = cw * (1 - l - r)
-    inner_h = ch * (1 - t - b)
-    if not (1.0 < ow / inner_w < 1.25 and 1.0 < oh / inner_h < 1.45):
-        return ph, True
-
-    iq = _inner_quad_from_blue(w1, oq, TRAY_INSET)
-
-    # 找不到真正內緣時才使用舊的固定比例方法。
-    if iq is None:
-        H = cv2.getPerspectiveTransform(
-            oq, np.float32([[0, 0], [1, 0], [1, 1], [0, 1]])
-        )
-        fl, fr, ft, fb = TRAY_INSET
-        inn = np.float32([
-            [fl, ft], [1 - fr, ft],
-            [1 - fr, 1 - fb], [fl, 1 - fb]
-        ])
-        p_w1 = cv2.perspectiveTransform(
-            inn.reshape(-1, 1, 2), np.linalg.inv(H)
-        ).reshape(-1, 2)
-        p = cv2.perspectiveTransform(
-            p_w1.reshape(-1, 1, 2), np.linalg.inv(M1)
-        ).reshape(-1, 2)
-        p = order_pts(p)
-        return p, True
-
-    p = cv2.perspectiveTransform(
-        iq.reshape(-1, 1, 2), np.linalg.inv(M1)
-    ).reshape(-1, 2)
+    w1 = cv2.warpPerspective(img, M1, (cw, ch), flags=cv2.INTER_LINEAR,
+                             borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0))
+    x0, x1, y0, y1 = cw * l, cw * (1 - r), ch * t, ch * (1 - b)
+    W, Hh = x1 - x0, y1 - y0
+    lines = _outer_lines(w1, big)           # 上、右、下、左
+    names = ["T", "R", "B", "L"]
+    n_sub = 0
+    fixed = []
+    for nm, ln in zip(names, lines):
+        if _side_ok(nm, ln, x0, x1, y0, y1):
+            fixed.append(ln)
+            continue
+        n_sub += 1                           # 這邊不可靠 → 用岩心槽範圍 + 典型距離代替
+        e = EXPECT[nm]
+        if nm == "T":
+            fixed.append((np.array([cw / 2, y0 - e * Hh]), np.array([1.0, 0.0])))
+        elif nm == "B":
+            fixed.append((np.array([cw / 2, y1 + e * Hh]), np.array([1.0, 0.0])))
+        elif nm == "L":
+            fixed.append((np.array([x0 - e * W, ch / 2]), np.array([0.0, 1.0])))
+        else:
+            fixed.append((np.array([x1 + e * W, ch / 2]), np.array([0.0, 1.0])))
+    q = []
+    for i in range(4):
+        p1, d1 = fixed[(i - 1) % 4]
+        p2, d2 = fixed[i]
+        A = np.array([d1, -d2]).T
+        tt = np.linalg.solve(A, p2 - p1)
+        q.append(p1 + tt[0] * d1)
+    oq = np.array(q, np.float32)           # tl, tr, br, bl（w1 座標）
+    H_ = cv2.getPerspectiveTransform(oq, np.float32([[0, 0], [1, 0], [1, 1], [0, 1]]))
+    fl, fr, ft, fb = TRAY_INSET
+    inn = np.float32([[fl, ft], [1 - fr, ft], [1 - fr, 1 - fb], [fl, 1 - fb]])
+    p_w1 = cv2.perspectiveTransform(inn.reshape(-1, 1, 2), np.linalg.inv(H_)).reshape(-1, 2)
+    # 保底：內框一定要把「岩心槽範圍（洞）」完整包住（再多留一點點），不可切到岩心
+    padx, pady = 0.006 * W, 0.010 * Hh
+    p_w1[0] = [min(p_w1[0][0], x0 - padx), min(p_w1[0][1], y0 - pady)]
+    p_w1[1] = [max(p_w1[1][0], x1 + padx), min(p_w1[1][1], y0 - pady)]
+    p_w1[2] = [max(p_w1[2][0], x1 + padx), max(p_w1[2][1], y1 + pady)]
+    p_w1[3] = [min(p_w1[3][0], x0 - padx), max(p_w1[3][1], y1 + pady)]
+    p = cv2.perspectiveTransform(p_w1.reshape(-1, 1, 2).astype(np.float32),
+                                 np.linalg.inv(M1)).reshape(-1, 2)
     p = order_pts(p)
-
     hh, ww = img.shape[:2]
-    bad = bool(
-        bad or np.any(p[:, 0] < 0) or np.any(p[:, 1] < 0) or
-        np.any(p[:, 0] > ww - 1) or np.any(p[:, 1] > hh - 1)
-    )
+    bad = bool(bad or n_sub >= 3 or np.any(p[:, 0] < 0) or np.any(p[:, 1] < 0)
+               or np.any(p[:, 0] > ww - 1) or np.any(p[:, 1] > hh - 1))
     return p, bad
 
 
-def _expand_source_quad(pts, pad=0.006):
-    """把來源四角向箱外微擴，避免內角剛好壓在岩心上造成切心。
-
-    pad=0.006 約為箱框尺寸的 0.6%；只補回極薄的安全區，不會明顯增加外部土面。
-    """
-    q = order_pts(pts).astype(np.float32)
-    if pad <= 0:
-        return q
-    c = q.mean(axis=0)
-    return c + (q - c) * (1.0 + float(pad))
-
-
-def warp_points(img, pts, out_w=2400, aspect=3.12, margin=MARGIN, source_pad=0.006):
-    """把四角拉成成果圖；來源角點先向箱外微擴，避免切到岩心。"""
+def warp_points(img, pts, out_w=2400, aspect=3.12, margin=MARGIN):
+    """把「內側四角」直接拉成長方形（成果圖＝內框 + 極小邊），跟範例 Word 的裁切一致。
+    手動點的四點與自動偵測的四點都走這一個函式，所以結果一致。"""
     mx, my = margin
     out_h = int(out_w / aspect)
     x0, x1 = out_w * mx, out_w * (1 - mx)
     y0, y1 = out_h * my, out_h * (1 - my)
     dst = np.array([[x0, y0], [x1, y0], [x1, y1], [x0, y1]], np.float32)
-    src = _expand_source_quad(pts, source_pad)
-    M = cv2.getPerspectiveTransform(src, dst)
+    M = cv2.getPerspectiveTransform(order_pts(pts), dst)
     return cv2.warpPerspective(img, M, (out_w, out_h), flags=cv2.INTER_CUBIC,
                                borderMode=cv2.BORDER_REPLICATE)
 
 
-def detect_occupied_rows(im, n=4):
-    """自動判斷最後一箱實際有幾列岩心。
-
-    以每槽的「非藍色比例 + 灰階紋理 + 邊緣密度」評分。
-    岩心槽通常明顯高於空的藍色槽；只接受從第 1 槽開始的連續前綴，
-    因此不會因單一空洞或碎石造成 1、3 兩槽被誤判成有岩心。
-    回傳 1..n；無法可靠判斷時回傳 n。
-    """
-    if n <= 1:
-        return 1
-
-    hsv = cv2.cvtColor(im, cv2.COLOR_RGB2HSV)
-    blue = cv2.inRange(hsv, (85, 60, 45), (118, 255, 255)) > 0
-    gray = cv2.cvtColor(im, cv2.COLOR_RGB2GRAY)
-    H, W = im.shape[:2]
-
-    scores = []
-    for k in range(n):
-        y0 = int(H * (k / n + 0.06 / n))
-        y1 = int(H * ((k + 1) / n - 0.06 / n))
-        x0, x1 = int(W * .07), int(W * .93)
-        if y1 <= y0 or x1 <= x0:
-            return n
-
-        bm = blue[y0:y1, x0:x1]
-        g = gray[y0:y1, x0:x1]
-        non_blue = float(1.0 - bm.mean())
-        texture = float(min(np.std(g) / 65.0, 1.0))
-        edge = float(min(cv2.Canny(g, 40, 120).mean() / 255.0 / .12, 1.0))
-
-        # 非藍色是主判斷，紋理/邊緣作輔助，降低土、箱壁反光造成的誤判。
-        score = .68 * non_blue + .20 * texture + .12 * edge
-        scores.append(score)
-
-    # 明顯空槽通常 < 0.25；若前面有岩心，採用前兩槽的中位數作為自適應基準。
-    head = np.array(scores[:min(2, n)], dtype=float)
-    adaptive = max(0.27, float(np.median(head)) * 0.42)
-
-    occupied = [s >= adaptive for s in scores]
-
-    # 只取連續前綴；中間偶爾碎石不足不會把後面的箱號切掉。
+def count_filled_channels(rect_img, n=4, margin=MARGIN, empty_thr=0.25):
+    """在拉正後的成果圖上，逐槽算「非藍色」比例：有岩心的槽 ≥ 0.7，空槽（藍色槽底）≈ 0。
+    回傳由上往下連續有岩心的槽數（岩心由上往下放；至少 1）。"""
+    a = np.asarray(rect_img)
+    H, W = a.shape[:2]
+    mx, my = margin
+    inner = a[int(H * my):int(H * (1 - my)), int(W * mx):int(W * (1 - mx))]
+    blue = cv2.inRange(cv2.cvtColor(inner, cv2.COLOR_RGB2HSV), (85, 70, 50), (118, 255, 255)) > 0
+    h, w = blue.shape
+    filled = []
+    for i in range(n):
+        band = blue[int(h * (i + 0.15) / n):int(h * (i + 0.85) / n), int(w * 0.04):int(w * 0.96)]
+        filled.append((1 - band.mean()) >= empty_thr)
     k = 0
-    for ok in occupied:
-        if not ok:
-            break
-        k += 1
-
-    # 若每一槽都很接近、沒有明顯空槽，視為滿箱。
-    if k == 0 or all(s >= adaptive * 0.90 for s in scores):
-        return n
-    return max(1, min(n, k))
+    for i, f in enumerate(filled):
+        if f:
+            k = i + 1
+    return max(k, 1)
 
 
 def crop_partial(im, k, n=4, margin=MARGIN):
