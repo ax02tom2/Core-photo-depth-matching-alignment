@@ -22,7 +22,7 @@ PAGE_MX, PAGE_MY = 2.0, 1.0
 HEADER_W, HEADER_H = 15.4, 3.17
 BOX_W, BOX_H = 15.15, 4.85
 NUM_COL_W = 1.0
-FULL_ASPECT = 3.12  # 滿箱成果圖寬/高（= BOX_W/BOX_H，範例 Word 的顯示比例）
+FULL_ASPECT = 3.12
 
 SERIF_PATHS = [
     "/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc",
@@ -33,10 +33,8 @@ SERIF_PATHS = [
     "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
 ]
 
-
 def natural_key(s):
     return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", s)]
-
 
 # ------------------------------------------------------------------ 影像前處理
 def load_image(file_or_bytes, max_side=3200, portrait_dir="ccw"):
@@ -50,10 +48,8 @@ def load_image(file_or_bytes, max_side=3200, portrait_dir="ccw"):
         arr = np.rot90(arr, 1 if portrait_dir == "ccw" else -1)
     return np.ascontiguousarray(arr)
 
-
 def rotate_extra(img, deg):
     return np.ascontiguousarray(np.rot90(img, (deg // 90) % 4))
-
 
 def order_pts(pts):
     pts = np.array(pts, dtype=np.float32).reshape(4, 2)
@@ -66,7 +62,6 @@ def order_pts(pts):
     br = bottom[np.argmax(bottom[:, 0]), :]
     return np.array([tl, tr, br, bl], dtype=np.float32)
 
-
 def _reduce_to_quad(hull):
     peri = cv2.arcLength(hull, True)
     for eps in np.linspace(0.005, 0.12, 60):
@@ -77,12 +72,10 @@ def _reduce_to_quad(hull):
             break
     return cv2.boxPoints(cv2.minAreaRect(hull)).astype(np.float32)
 
-
 def _extreme_quad(hull):
     p = hull.reshape(-1, 2).astype(np.float32)
     sm_, df = p.sum(axis=1), p[:, 0] - p[:, 1]
     return np.array([p[np.argmin(sm_)], p[np.argmax(df)], p[np.argmax(sm_)], p[np.argmin(df)]], np.float32)
-
 
 def _refine_quad(pts, quad, tol_frac=0.05):
     pts = pts.reshape(-1, 2).astype(np.float32)
@@ -138,7 +131,6 @@ def _refine_quad(pts, quad, tol_frac=0.05):
         return quad
     return out
 
-
 def _extend_missing(quad, full_aspect=3.1, thr=1.25):
     tl, tr, br, bl = quad
     w = (np.linalg.norm(tr - tl) + np.linalg.norm(br - bl)) / 2
@@ -148,12 +140,10 @@ def _extend_missing(quad, full_aspect=3.1, thr=1.25):
     k = (w / full_aspect - h) / h
     return np.array([tl, tr, br + (br - tr) * k, bl + (bl - tl) * k], np.float32)
 
-
 def _blue_mask(sm):
     hsv = cv2.cvtColor(sm, cv2.COLOR_RGB2HSV)
     mask = cv2.inRange(hsv, (85, 80, 60), (118, 255, 255))
     return cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
-
 
 def _detect_holes(img, full_aspect=3.1):
     h, w = img.shape[:2]
@@ -189,17 +179,41 @@ def _detect_holes(img, full_aspect=3.1):
     quad = order_pts(quad)
     quad = _extend_missing(quad, full_aspect)
     
-    # 嚴格的幾何條件判斷 (避免不合理的扭曲被當作正常)
+    # ---------------- 修正重點：嚴格的幾何條件判斷 ----------------
     area = cv2.contourArea(quad)
     bad = area < 0.05 * sh * sw
-    bad = bad or bool(np.any(quad < 2) or np.any(quad[:, 0] > sw - 3) or np.any(quad[:, 1] > sh - 3))
     
-    return order_pts(quad / sc), bool(bad)
+    # 判斷長寬比例與變形
+    w1_len = np.linalg.norm(quad[1] - quad[0])
+    w2_len = np.linalg.norm(quad[2] - quad[3])
+    h1_len = np.linalg.norm(quad[3] - quad[0])
+    h2_len = np.linalg.norm(quad[2] - quad[1])
+    avg_w = (w1_len + w2_len) / 2.0
+    avg_h = (h1_len + h2_len) / 2.0
+    
+    if avg_h > 0 and avg_w > 0:
+        # 1. 長寬比限制
+        ratio = avg_w / avg_h
+        if ratio < 2.0 or ratio > 4.2:
+            bad = True
+        # 2. 邊長落差 (梯形變形過大超過 10%)
+        if abs(w1_len - w2_len) > avg_w * 0.10: bad = True
+        if abs(h1_len - h2_len) > avg_h * 0.10: bad = True
+        # 3. 內角角度檢測 (四個角應接近 90 度，若偏移大於 11.5 度即判定異常)
+        for i in range(4):
+            v1 = quad[i] - quad[(i+1)%4]
+            v2 = quad[(i+2)%4] - quad[(i+1)%4]
+            n1, n2 = np.linalg.norm(v1), np.linalg.norm(v2)
+            if n1 > 0 and n2 > 0:
+                cos_theta = abs(np.dot(v1, v2) / (n1 * n2))
+                if cos_theta > 0.20:
+                    bad = True
 
+    bad = bad or bool(np.any(quad < 2) or np.any(quad[:, 0] > sw - 3) or np.any(quad[:, 1] > sh - 3))
+    return order_pts(quad / sc), bool(bad)
 
 TRAY_INSET = (0.021, 0.022, 0.061, 0.074)  
 MARGIN = (0.004, 0.006)                    
-
 
 def _warp_to(img, pts, out_w, out_h, inner):
     l, r, t, b = inner
@@ -209,7 +223,6 @@ def _warp_to(img, pts, out_w, out_h, inner):
     M = cv2.getPerspectiveTransform(order_pts(pts), dst)
     return cv2.warpPerspective(img, M, (out_w, out_h), flags=cv2.INTER_CUBIC,
                                borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0))
-
 
 def _walk_out(line, start, step, cap, gap=6, find=40):
     n = len(line)
@@ -231,7 +244,6 @@ def _walk_out(line, start, step, cap, gap=6, find=40):
                 break
     return last
 
-
 def _fit_line_robust(pts):
     pts = np.array(pts, np.float32)
     if len(pts) < 12:
@@ -246,7 +258,6 @@ def _fit_line_robust(pts):
         pts = pts[keep]
     return np.array([x0, y0]), np.array([vx, vy])
 
-
 def _outer_quad(w, big):
     h, wd = w.shape[:2]
     hsv = cv2.cvtColor(cv2.resize(w, (wd // 2, h // 2)), cv2.COLOR_RGB2HSV)
@@ -259,18 +270,14 @@ def _outer_quad(w, big):
     L, R, T, B = [], [], [], []
     for y in range(y0 + (y1 - y0) // 8, y1 - (y1 - y0) // 8, 2):
         a = _walk_out(m[y], x0, -1, capx)
-        if a is not None:
-            L.append((a, y))
+        if a is not None: L.append((a, y))
         a = _walk_out(m[y], x1, +1, capx)
-        if a is not None:
-            R.append((a, y))
+        if a is not None: R.append((a, y))
     for x in range(x0 + (x1 - x0) // 8, x1 - (x1 - x0) // 8, 2):
         a = _walk_out(m[:, x], y0, -1, capy)
-        if a is not None:
-            T.append((x, a))
+        if a is not None: T.append((x, a))
         a = _walk_out(m[:, x], y1, +1, capy)
-        if a is not None:
-            B.append((x, a))
+        if a is not None: B.append((x, a))
     lines = [_fit_line_robust(T), _fit_line_robust(R), _fit_line_robust(B), _fit_line_robust(L)]
     if any(ln is None for ln in lines):
         return None
@@ -284,7 +291,6 @@ def _outer_quad(w, big):
         tt = np.linalg.solve(A, p2 - p1)
         q.append(p1 + tt[0] * d1)
     return np.array(q, np.float32) * 2
-
 
 def detect_inner(img, full_aspect=3.1, inset_adj=0.0):
     ph, bad = _detect_holes(img, full_aspect)
@@ -315,40 +321,35 @@ def detect_inner(img, full_aspect=3.1, inset_adj=0.0):
     p_w1 = cv2.perspectiveTransform(inn.reshape(-1, 1, 2), np.linalg.inv(H)).reshape(-1, 2)
     p = cv2.perspectiveTransform(p_w1.reshape(-1, 1, 2), np.linalg.inv(M1)).reshape(-1, 2)
     p = order_pts(p)
-    
-    # 【新增】嚴格幾何變形判斷：精準挑出 21-24m 等形狀錯誤的紅框
-    w1_len = np.linalg.norm(p[1] - p[0]) # 上緣寬
-    w2_len = np.linalg.norm(p[2] - p[3]) # 下緣寬
-    h1_len = np.linalg.norm(p[3] - p[0]) # 左緣高
-    h2_len = np.linalg.norm(p[2] - p[1]) # 右緣高
-    
+
+    # 進行最終產出框的再次幾何檢驗
+    w1_len = np.linalg.norm(p[1] - p[0])
+    w2_len = np.linalg.norm(p[2] - p[3])
+    h1_len = np.linalg.norm(p[3] - p[0])
+    h2_len = np.linalg.norm(p[2] - p[1])
     avg_w = (w1_len + w2_len) / 2.0
     avg_h = (h1_len + h2_len) / 2.0
     
     if avg_h == 0 or avg_w == 0:
         bad = True
     else:
-        # 1. 長寬比例是否太離譜 (正常約為 3.12 左右)
         ratio = avg_w / avg_h
-        if ratio < 1.8 or ratio > 4.8:
-            bad = True
-        # 2. 上下/左右的長度落差是否太大 (梯形形變過大)
-        if abs(w1_len - w2_len) > avg_w * 0.15:
-            bad = True
-        if abs(h1_len - h2_len) > avg_h * 0.15:
-            bad = True
-        # 3. 對角線是否差不多長 (確保是矩形)
-        diag1 = np.linalg.norm(p[2] - p[0])
-        diag2 = np.linalg.norm(p[3] - p[1])
-        if abs(diag1 - diag2) > ((diag1 + diag2) / 2.0) * 0.15:
-            bad = True
+        if ratio < 2.0 or ratio > 4.2: bad = True
+        if abs(w1_len - w2_len) > avg_w * 0.10: bad = True
+        if abs(h1_len - h2_len) > avg_h * 0.10: bad = True
+        for i in range(4):
+            v1 = p[i] - p[(i+1)%4]
+            v2 = p[(i+2)%4] - p[(i+1)%4]
+            n1, n2 = np.linalg.norm(v1), np.linalg.norm(v2)
+            if n1 > 0 and n2 > 0:
+                if abs(np.dot(v1, v2) / (n1 * n2)) > 0.20:
+                    bad = True
 
     hh, ww = img.shape[:2]
     bad = bool(bad or np.any(p[:, 0] < 0) or np.any(p[:, 1] < 0)
                or np.any(p[:, 0] > ww - 1) or np.any(p[:, 1] > hh - 1))
                
     return p, bad
-
 
 def warp_points(img, pts, out_w=2400, aspect=3.12, margin=MARGIN):
     mx, my = margin
@@ -360,7 +361,6 @@ def warp_points(img, pts, out_w=2400, aspect=3.12, margin=MARGIN):
     return cv2.warpPerspective(img, M, (out_w, out_h), flags=cv2.INTER_CUBIC,
                                borderMode=cv2.BORDER_REPLICATE)
 
-
 def crop_partial(im, k, n=4, margin=MARGIN):
     if not k or k >= n:
         return im
@@ -368,7 +368,6 @@ def crop_partial(im, k, n=4, margin=MARGIN):
     H = im.height
     cut = (my + (1 - 2 * my) * k / n + 0.010) * H
     return im.crop((0, 0, im.width, int(min(H, cut))))
-
 
 def auto_detect_filled_rows(img, total_rows=4):
     try:
@@ -394,9 +393,7 @@ def auto_detect_filled_rows(img, total_rows=4):
                 
         return max(1, int(filled_count))
     except Exception:
-        # 防呆：如果計算出錯，預設回傳滿箱列數
         return int(total_rows)
-
 
 def draw_corners(img, pts, color=(255, 0, 0)):
     out = img.copy()
@@ -407,8 +404,6 @@ def draw_corners(img, pts, color=(255, 0, 0)):
         cv2.circle(out, tuple(int(v) for v in q), t * 3, (255, 255, 0), -1)
     return out
 
-
-# ------------------------------------------------------------------ 表頭（告示牌照片 + 填字）
 def _font(size):
     for p in SERIF_PATHS:
         if os.path.exists(p):
@@ -419,12 +414,26 @@ def _font(size):
                     continue
     return ImageFont.load_default()
 
+# ---------------- 修正重點：終極防呆機制，避免 Base64 崩毀 ----------------
 def make_header(hole, depth, date, project, board=None):
+    im = None
     if board is not None:
-        im = Image.open(io.BytesIO(board)).convert("RGB")
-    else:
-        im = Image.open(io.BytesIO(base64.b64decode(BOARD_B64))).convert("RGB")
-        
+        try:
+            im = Image.open(io.BytesIO(board)).convert("RGB")
+        except Exception:
+            pass
+            
+    if im is None:
+        try:
+            # 嘗試使用您的原始 B64 字串，若無法解碼也不會當機
+            im = Image.open(io.BytesIO(base64.b64decode(BOARD_B64))).convert("RGB")
+        except Exception:
+            # 終極防呆：回傳一張空白圖片，確保產生 PDF/Word 流程絕對不會中斷
+            im = Image.new("RGB", (1540, 317), (240, 240, 240))
+            d = ImageDraw.Draw(im)
+            d.text((50, 100), "Missing Header Image. Please upload 'board_up'.", fill=(255, 0, 0))
+            return im
+            
     W, H = im.size
     fill = im.getpixel((int(W * 0.30), int(H * 0.64)))
     d = ImageDraw.Draw(im)
@@ -449,7 +458,6 @@ def make_header(hole, depth, date, project, board=None):
     cell(0.613, 0.528, 0.985, 0.755, depth, int(H * 0.17))
     return im
 
-
 def _text_img(text, size):
     fp = next((p for p in SERIF_PATHS if os.path.exists(p)), None)
     if not fp:
@@ -460,18 +468,16 @@ def _text_img(text, size):
     ImageDraw.Draw(im).text((10 - bb[0], 10 - bb[1]), text, font=f, fill="black")
     return im
 
-
 def _jpeg(im, q=88):
     b = io.BytesIO()
     im.convert("RGB").save(b, "JPEG", quality=q)
     b.seek(0)
     return b
 
-
 def _pages(boxes, rows_per_box, per_page, start_depth, row_m, total_rows=0):
     total_rows = total_rows or len(boxes) * rows_per_box
     bpp = int(per_page // rows_per_box)
-    if bpp == 0: bpp = 1  # 防呆避免除數問題
+    if bpp == 0: bpp = 1  
     for p in range(0, len(boxes), bpp):
         chunk = boxes[p:p + bpp]
         r0 = p * rows_per_box
@@ -479,8 +485,6 @@ def _pages(boxes, rows_per_box, per_page, start_depth, row_m, total_rows=0):
         d0 = start_depth + r0 * row_m
         yield chunk, r0, n, f"{d0}~{d0 + n * row_m}m"
 
-
-# ------------------------------------------------------------------ PDF
 def build_pdf(boxes, hole, date, project, start_depth=0, rows_per_box=4,
               per_page=20, row_m=1, board=None, end_mark=True, total_rows=0):
     buf = io.BytesIO()
@@ -516,8 +520,6 @@ def build_pdf(boxes, hole, date, project, start_depth=0, rows_per_box=4,
     c.save()
     return buf.getvalue()
 
-
-# ------------------------------------------------------------------ Word
 def build_docx(boxes, hole, date, project, start_depth=0, rows_per_box=4,
                per_page=20, row_m=1, board=None, end_mark=True, total_rows=0):
     from docx import Document
@@ -609,6 +611,7 @@ def build_docx(boxes, hole, date, project, start_depth=0, rows_per_box=4,
     doc.save(out)
     return out.getvalue()
 
+# (此處為避免再次出錯，我已清空亂碼。請您直接保留您原始專案裡面的這行長字串)
 BOARD_B64 = (
     "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAYEBAUEBAYFBQUGBgYHCQ4JCQgICRINDQoOFRIWFhUSFBQXGiEcFxgfGRQUHScdHyIj"
     "JSUlFhwpLCgkKyEkJST/2wBDAQYGBgkICREJCREkGBQYJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk"
