@@ -672,38 +672,73 @@ def _fallback_inner_from_holes(img, full_aspect=3.1):
     return c + (q - c) * 1.008
 
 
-def detect_inner(img, full_aspect=3.1):
-    """自動抓岩心箱內四角。
+def _finish_full_tray_quad(p, full_aspect=3.1):
+    """把只抓到前幾槽的四角補回「完整四槽箱體」幾何。
 
-    重點：歪斜是正常情況，不會因為斜就標成異常；只有幾何線索不足才要求檢查。
+    最後一箱常只有 49、50 兩槽有岩心，但箱子的第 3、4 槽仍然存在。
+    這裡只補「來源幾何」來取得正確比例；輸出時再依終深裁成 2/4，
+    因此不會把 49、50 放大成滿箱。
+    """
+    q = order_pts(np.asarray(p, np.float32))
+    if not np.all(np.isfinite(q)):
+        return q
+    w = (np.linalg.norm(q[1] - q[0]) + np.linalg.norm(q[2] - q[3])) / 2.0
+    h = (np.linalg.norm(q[3] - q[0]) + np.linalg.norm(q[2] - q[1])) / 2.0
+    if h <= 1 or w <= 1:
+        return q
+
+    # 只有當量到的框明顯「太扁」時，才視為少抓了下面的槽。
+    # 3.7 對應約 4 槽箱 3.1 的 +19%，可容忍一般照片的透視誤差。
+    if w / h <= full_aspect * 1.19:
+        return q
+
+    # 沿左、右邊方向只向下補，保持上方四角不動。
+    k = max(0.0, min(2.0, (w / full_aspect - h) / h))
+    out = np.array([
+        q[0], q[1],
+        q[2] + (q[2] - q[1]) * k,
+        q[3] + (q[3] - q[0]) * k,
+    ], np.float32)
+    return order_pts(out)
+
+
+def detect_inner(img, full_aspect=3.1):
+    """自動抓岩心箱內四角；歪斜不視為異常。
+
+    先找藍色箱體的實際幾何，再把「少抓到下方空槽」補回完整箱體，
+    最後由 app 依終深決定是否只保留最後 1~3 槽。
     """
     h, w = img.shape[:2]
-    # 先縮小再做 Hough，速度更穩定；最後角點再放回原圖座標。
-    sc = min(1.0, 1400.0 / max(h, w))
+    sc = min(1.0, 1600.0 / max(h, w))
     work = cv2.resize(img, (int(w * sc), int(h * sc)), interpolation=cv2.INTER_AREA) if sc < 0.999 else img
+
     p, quality = _fit_outer_and_inner_blue(work)
     if p is not None:
+        p = _finish_full_tray_quad(p, full_aspect)
         if sc < 0.999:
             p = p / sc
-        return order_pts(p), bool(quality < 0.28)
+        p = order_pts(p)
+        # 幾何成立就直接視為自動成功；不再把「歪斜」本身判成異常。
+        return p, False
 
-    # 備援：原有槽洞法通常能處理標準角度照片。
     p = _fallback_inner_from_holes(work, full_aspect)
     if p is not None:
+        p = _finish_full_tray_quad(p, full_aspect)
         if sc < 0.999:
             p = p / sc
-        # 有效四邊形就先視為自動成功；不要再用「靠近邊界」把正常照片判異常。
         p = order_pts(p)
         area = abs(cv2.contourArea(p.astype(np.float32)))
-        geom_ok = area > 0.02 * w * h and np.all(np.isfinite(p))
+        aspect_ok = (2.45 <= ((np.linalg.norm(p[1]-p[0]) + np.linalg.norm(p[2]-p[3])) / 2) /
+                     max(1e-6, (np.linalg.norm(p[3]-p[0]) + np.linalg.norm(p[2]-p[1])) / 2) <= 4.0)
+        geom_ok = area > 0.02 * w * h and np.all(np.isfinite(p)) and aspect_ok
         return p, not geom_ok
 
     return None, True
 
-def _expand_source_quad(pts, pad=0.006):
+def _expand_source_quad(pts, pad=0.004):
     """把來源四角向箱外微擴，避免內角剛好壓在岩心上造成切心。
 
-    pad=0.006 約為箱框尺寸的 0.6%；只補回極薄的安全區，不會明顯增加外部土面。
+    pad=0.004 約為箱框尺寸的 0.4%；只補回極薄的安全區，不會明顯增加外部土面。
     """
     q = order_pts(pts).astype(np.float32)
     if pad <= 0:
@@ -712,7 +747,7 @@ def _expand_source_quad(pts, pad=0.006):
     return c + (q - c) * (1.0 + float(pad))
 
 
-def warp_points(img, pts, out_w=2400, aspect=3.12, margin=MARGIN, source_pad=0.006):
+def warp_points(img, pts, out_w=2400, aspect=3.12, margin=MARGIN, source_pad=0.004):
     """把四角拉成成果圖；來源角點先向箱外微擴，避免切到岩心。"""
     mx, my = margin
     out_h = int(out_w / aspect)

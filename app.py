@@ -24,7 +24,7 @@ build_docx = core.build_docx
 st.set_page_config(page_title="岩心照片校正與成果輸出", layout="wide")
 st.title("岩心箱照片：轉橫 → 箱內四角校正 → 成果輸出")
 
-APP_VERSION = "2.2"
+APP_VERSION = "2.3"
 
 
 def _parse_end_depth(text):
@@ -69,16 +69,16 @@ with st.sidebar:
     aspect = st.number_input("成果圖整箱 寬/高", 1.5, 5.0, 3.12, 0.01)
 
     st.header("成果裁切")
-    st.caption("成果圖以箱內四個內角為主，並保留極小安全邊。")
+    st.caption("先做四角透視校正，再在成果畫布留極小邊；不是單純裁切。最後一箱會按終深裁掉後續空槽。")
     mgx = st.slider("左右多留 %", 0.0, 3.0, 0.4, 0.1) / 100
     mgy = st.slider("上下多留 %", 0.0, 3.0, 0.6, 0.1) / 100
     source_pad = st.slider(
         "內角向箱外安全外擴 %",
         0.0,
         2.0,
-        0.6,
+        0.4,
         0.1,
-        help="角點先向箱外微擴，降低岩心被切到的機率。",
+        help="只增加來源安全邊；不改變最後成果比例。",
     ) / 100
 
     rows_per_box = st.number_input("每箱列數", 1, 10, 4)
@@ -294,7 +294,7 @@ b2.metric("⚠ 需確認", counts["需確認"])
 b3.metric("✋ 手動", counts["手動"])
 
 badge_html = []
-for n in files:
+for n in output_files_effective():
     s = status[n.name]
     if s == "自動OK":
         badge_html.append(
@@ -426,34 +426,35 @@ if st.button("產生 Word / PDF", type="primary"):
         except Exception as e:
             failed = (f.name, e)
             break
-        bar.progress((i + 1) / len(out_files))
+        bar.progress((i + 1) / max(1, len(out_files)))
 
     if failed:
         bar.empty()
-        st.error(f"處理 {failed[0]} 失敗，請確認 app.py 與 core.py 都是同一版。")
+        st.error(f"處理 {failed[0]} 失敗")
         st.code(f"{type(failed[1]).__name__}: {failed[1]}")
     else:
+        kw = dict(
+            hole=hole, date=date, project=project, start_depth=start_depth,
+            rows_per_box=rows_per_box, per_page=per_page, row_m=row_m,
+            board=board_up if board_up else None, end_mark=end_mark,
+            total_rows=_total_rows,
+        )
+        # PDF / Word 分開輸出；其中一個失敗不會讓另一個下載按鈕變成 KeyError。
+        st.session_state.pop("pdf", None)
+        st.session_state.pop("docx", None)
         try:
-            kw = dict(
-                hole=hole,
-                date=date,
-                project=project,
-                start_depth=start_depth,
-                rows_per_box=rows_per_box,
-                per_page=per_page,
-                row_m=row_m,
-                board=board_up if board_up else None,
-                end_mark=end_mark,
-                total_rows=_total_rows,
-            )
             st.session_state["pdf"] = build_pdf(boxes, **kw)
-            st.session_state["docx"] = build_docx(boxes, **kw)
-            bar.empty()
-            st.success("✓ Word / PDF 產生完成")
         except Exception as e:
-            bar.empty()
-            st.error("輸出失敗")
+            st.error("PDF 輸出失敗")
             st.code(f"{type(e).__name__}: {e}")
+        try:
+            st.session_state["docx"] = build_docx(boxes, **kw)
+        except Exception as e:
+            st.error("Word 輸出失敗")
+            st.code(f"{type(e).__name__}: {e}")
+        bar.empty()
+        if "pdf" in st.session_state and "docx" in st.session_state:
+            st.success("✓ Word / PDF 產生完成")
 
 if "pdf" in st.session_state:
     d1, d2 = st.columns(2)
@@ -463,11 +464,14 @@ if "pdf" in st.session_state:
         file_name=f"{hole}_岩心照片.pdf",
         mime="application/pdf",
     )
-    d2.download_button(
-        "下載 Word",
-        st.session_state["docx"],
-        file_name=f"{hole}_岩心照片.docx",
-        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    )
+    if "docx" in st.session_state:
+        d2.download_button(
+            "下載 Word",
+            st.session_state["docx"],
+            file_name=f"{hole}_岩心照片.docx",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        )
+    else:
+        d2.warning("Word 尚未產生")
 
 st.caption(f"程式版本 {APP_VERSION}")
