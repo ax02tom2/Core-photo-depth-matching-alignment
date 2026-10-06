@@ -22,7 +22,7 @@ PAGE_MX, PAGE_MY = 2.0, 1.0
 HEADER_W, HEADER_H = 15.4, 3.17
 BOX_W, BOX_H = 15.15, 4.85
 NUM_COL_W = 1.0
-FULL_ASPECT = 3.12  # 滿箱成果圖寬/高（= BOX_W/BOX_H，範例 Word 的顯示比例）
+FULL_ASPECT = 3.12  
 
 SERIF_PATHS = [
     "/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc",
@@ -36,7 +36,6 @@ SERIF_PATHS = [
 def natural_key(s):
     return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", s)]
 
-# ------------------------------------------------------------------ 影像前處理
 def load_image(file_or_bytes, max_side=3200, portrait_dir="ccw"):
     im = Image.open(file_or_bytes)
     im = ImageOps.exif_transpose(im).convert("RGB")
@@ -99,11 +98,8 @@ def _refine_quad(pts, quad, tol_frac=0.05):
         vx, vy, x0, y0 = cv2.fitLine(sel, cv2.DIST_HUBER, 0, 0.01, 0.01).ravel()
         lines.append((np.array([x0, y0]), np.array([vx, vy])))
         
-    def ang(d):
-        return np.arctan2(d[1], d[0])
-
-    def lr_dir(d):  
-        return d if d[1] >= 0 else -d
+    def ang(d): return np.arctan2(d[1], d[0])
+    def lr_dir(d): return d if d[1] >= 0 else -d
 
     top_d, bot_d = lines[0][1], lines[2][1]
     top_d = top_d if top_d[0] >= 0 else -top_d
@@ -122,21 +118,18 @@ def _refine_quad(pts, quad, tol_frac=0.05):
         p1, d1 = lines[(i - 1) % 4]
         p2, d2 = lines[i]
         A = np.array([d1, -d2]).T
-        if abs(np.linalg.det(A)) < 1e-6:
-            return quad
+        if abs(np.linalg.det(A)) < 1e-6: return quad
         t = np.linalg.solve(A, p2 - p1)
         out.append(p1 + t[0] * d1)
     out = np.array(out, np.float32)
-    if np.linalg.norm(out - q, axis=1).max() > 0.2 * short:  
-        return quad
+    if np.linalg.norm(out - q, axis=1).max() > 0.2 * short: return quad
     return out
 
 def _extend_missing(quad, full_aspect=3.1, thr=1.25):
     tl, tr, br, bl = quad
     w = (np.linalg.norm(tr - tl) + np.linalg.norm(br - bl)) / 2
     h = (np.linalg.norm(bl - tl) + np.linalg.norm(br - tr)) / 2
-    if h <= 0 or w / h < full_aspect * thr:
-        return quad
+    if h <= 0 or w / h < full_aspect * thr: return quad
     k = (w / full_aspect - h) / h
     return np.array([tl, tr, br + (br - tr) * k, bl + (bl - tl) * k], np.float32)
 
@@ -160,10 +153,8 @@ def _detect_holes(img, full_aspect=3.1):
         for idx, c in enumerate(cnts):
             if hier[0][idx][3] != -1: 
                 a = cv2.contourArea(c)
-                if a > 0.004 * sh * sw:
-                    holes.append((a, c))
-    if not holes:
-        return None, True
+                if a > 0.004 * sh * sw: holes.append((a, c))
+    if not holes: return None, True
     holes.sort(key=lambda t: -t[0])
     a0, c0 = holes[0]
     (cx0, cy0), (rw, rh), _ = cv2.minAreaRect(c0)
@@ -182,7 +173,6 @@ def _detect_holes(img, full_aspect=3.1):
     area = cv2.contourArea(quad)
     bad = area < 0.05 * sh * sw
     bad = bad or bool(np.any(quad < 2) or np.any(quad[:, 0] > sw - 3) or np.any(quad[:, 1] > sh - 3))
-    
     return order_pts(quad / sc), bool(bad)
 
 TRAY_INSET = (0.021, 0.022, 0.061, 0.074)  
@@ -203,8 +193,7 @@ def _walk_out(line, start, step, cap, gap=6, find=40):
     while 0 <= i < n and not line[i] and k < find:
         i += step
         k += 1
-    if not (0 <= i < n and line[i]):
-        return None
+    if not (0 <= i < n and line[i]): return None
     last, miss, k = i, 0, 0
     while 0 <= i + step < n and k < cap:
         i += step
@@ -213,21 +202,18 @@ def _walk_out(line, start, step, cap, gap=6, find=40):
             last, miss = i, 0
         else:
             miss += 1
-            if miss >= gap:
-                break
+            if miss >= gap: break
     return last
 
 def _fit_line_robust(pts):
     pts = np.array(pts, np.float32)
-    if len(pts) < 12:
-        return None
+    if len(pts) < 12: return None
     for _ in range(2):
         vx, vy, x0, y0 = cv2.fitLine(pts, cv2.DIST_HUBER, 0, 0.01, 0.01).ravel()
         nrm = np.array([-vy, vx])
         res = np.abs((pts - np.array([x0, y0])) @ nrm)
         keep = res <= max(1.5, 2.5 * np.median(res) + 1)
-        if keep.sum() < 12:
-            break
+        if keep.sum() < 12: break
         pts = pts[keep]
     return np.array([x0, y0]), np.array([vx, vy])
 
@@ -252,23 +238,20 @@ def _outer_quad(w, big):
         a = _walk_out(m[:, x], y1, +1, capy)
         if a is not None: B.append((x, a))
     lines = [_fit_line_robust(T), _fit_line_robust(R), _fit_line_robust(B), _fit_line_robust(L)]
-    if any(ln is None for ln in lines):
-        return None
+    if any(ln is None for ln in lines): return None
     q = []
     for i in range(4):
         p1, d1 = lines[(i - 1) % 4]
         p2, d2 = lines[i]
         A = np.array([d1, -d2]).T
-        if abs(np.linalg.det(A)) < 1e-6:
-            return None
+        if abs(np.linalg.det(A)) < 1e-6: return None
         tt = np.linalg.solve(A, p2 - p1)
         q.append(p1 + tt[0] * d1)
     return np.array(q, np.float32) * 2
 
 def detect_inner(img, full_aspect=3.1, inset_adj=0.0):
     ph, bad = _detect_holes(img, full_aspect)
-    if ph is None:
-        return None, True
+    if ph is None: return None, True
     cw = 2400
     ch = int(cw / 2.9)
     big = (0.07, 0.07, 0.14, 0.14)
@@ -279,8 +262,7 @@ def detect_inner(img, full_aspect=3.1, inset_adj=0.0):
     w1 = cv2.warpPerspective(img, M1, (cw, ch), flags=cv2.INTER_LINEAR,
                              borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0))
     oq = _outer_quad(w1, big)
-    if oq is None:
-        return ph, True
+    if oq is None: return ph, True
         
     H = cv2.getPerspectiveTransform(oq, np.float32([[0, 0], [1, 0], [1, 1], [0, 1]]))
     fl, fr, ft, fb = TRAY_INSET
@@ -295,7 +277,7 @@ def detect_inner(img, full_aspect=3.1, inset_adj=0.0):
     p = cv2.perspectiveTransform(p_w1.reshape(-1, 1, 2), np.linalg.inv(M1)).reshape(-1, 2)
     p = order_pts(p)
 
-    # ---------------- 修正重點：極度嚴格的幾何異常檢測 ----------------
+    # ---------------- 修正重點：極嚴格的 5 道幾何異常檢測 ----------------
     w1_len = np.linalg.norm(p[1] - p[0])
     w2_len = np.linalg.norm(p[2] - p[3])
     h1_len = np.linalg.norm(p[3] - p[0])
@@ -310,30 +292,25 @@ def detect_inner(img, full_aspect=3.1, inset_adj=0.0):
     if avg_h == 0 or avg_w == 0:
         bad = True
     else:
+        # 1. 嚴格長寬比 (岩心箱絕對是在 2.75 ~ 3.45 之間，不在此範圍一定是抓錯)
         ratio = avg_w / avg_h
-        # 1. 嚴格長寬比例檢測 (標準為 3.12，若框到其他區域會變太胖或太扁)
-        if ratio < 2.6 or ratio > 3.6: 
-            bad = True
+        if ratio < 2.75 or ratio > 3.45: bad = True
         
-        # 2. 面積比例檢測 (紅框佔據整張照片的比例，過大過小皆異常)
-        if frame_area / img_area < 0.35 or frame_area / img_area > 0.95:
-            bad = True
+        # 2. 梯形扭曲極限 (上下或左右邊長落差不得超過 6%)
+        if abs(w1_len - w2_len) > avg_w * 0.06: bad = True
+        if abs(h1_len - h2_len) > avg_h * 0.06: bad = True
+        
+        # 3. 傾斜角度偵測 (若紅框嚴重傾斜超過 4.5 度，視為異常)
+        slope_top = abs(p[1][1] - p[0][1]) / (abs(p[1][0] - p[0][0]) + 1e-5)
+        slope_bottom = abs(p[2][1] - p[3][1]) / (abs(p[2][0] - p[3][0]) + 1e-5)
+        if slope_top > 0.08 or slope_bottom > 0.08: bad = True
             
-        # 3. 嚴格梯形變形檢測 (上下、左右邊長落差不得大於 8%)
-        if abs(w1_len - w2_len) > avg_w * 0.08: bad = True
-        if abs(h1_len - h2_len) > avg_h * 0.08: bad = True
-        
-        # 4. 內角角度檢測 (四個角應接近 90 度)
-        for i in range(4):
-            v1 = p[i] - p[(i+1)%4]
-            v2 = p[(i+2)%4] - p[(i+1)%4]
-            n1, n2 = np.linalg.norm(v1), np.linalg.norm(v2)
-            if n1 > 0 and n2 > 0:
-                if abs(np.dot(v1, v2) / (n1 * n2)) > 0.20:
-                    bad = True
+        # 4. 面積異常檢測 (紅框過大佔據超過全圖 90%，或小於 40% 皆異常)
+        if frame_area / img_area < 0.40 or frame_area / img_area > 0.90: bad = True
 
-    bad = bool(bad or np.any(p[:, 0] < 0) or np.any(p[:, 1] < 0)
-               or np.any(p[:, 0] > ww - 1) or np.any(p[:, 1] > hh - 1))
+    # 5. 貼邊檢測 (距離邊界小於 10 像素視為異常)
+    bad = bool(bad or np.any(p[:, 0] < 10) or np.any(p[:, 1] < 10)
+               or np.any(p[:, 0] > ww - 10) or np.any(p[:, 1] > hh - 10))
                
     return p, bad
 
@@ -348,8 +325,7 @@ def warp_points(img, pts, out_w=2400, aspect=3.12, margin=MARGIN):
                                borderMode=cv2.BORDER_REPLICATE)
 
 def crop_partial(im, k, n=4, margin=MARGIN):
-    if not k or k >= n:
-        return im
+    if not k or k >= n: return im
     mx, my = margin
     H = im.height
     cut = (my + (1 - 2 * my) * k / n + 0.010) * H
@@ -373,10 +349,7 @@ def auto_detect_filled_rows(img, total_rows=4):
             
             blue_mask = cv2.inRange(strip, (85, 50, 50), (125, 255, 255))
             blue_ratio = np.sum(blue_mask > 0) / area
-            
-            if blue_ratio < 0.40:
-                filled_count = i + 1
-                
+            if blue_ratio < 0.40: filled_count = i + 1
         return max(1, int(filled_count))
     except Exception:
         return int(total_rows)
@@ -386,40 +359,48 @@ def draw_corners(img, pts, color=(255, 0, 0)):
     p = order_pts(pts).astype(np.int32)
     t = max(3, img.shape[1] // 300)
     cv2.polylines(out, [p.reshape(-1, 1, 2)], True, color, t)
-    for q in p:
-        cv2.circle(out, tuple(int(v) for v in q), t * 3, (255, 255, 0), -1)
+    for q in p: cv2.circle(out, tuple(int(v) for v in q), t * 3, (255, 255, 0), -1)
     return out
 
 def _font(size):
     for p in SERIF_PATHS:
         if os.path.exists(p):
             for idx in (3, 0):
-                try:
-                    return ImageFont.truetype(p, size, index=idx)
-                except Exception:
-                    continue
+                try: return ImageFont.truetype(p, size, index=idx)
+                except Exception: continue
     return ImageFont.load_default()
 
-# ---------------- 修正重點：完整恢復 Base64 編碼，解決空白表頭 ----------------
+# ---------------- 修正重點：完整補回表頭，並加入徹底的備援防呆 ----------------
 def make_header(hole, depth, date, project, board=None):
     im = None
+    # 步驟 1: 嘗試讀取使用者上傳的自訂表頭
     if board is not None:
         try:
             im = Image.open(io.BytesIO(board)).convert("RGB")
         except Exception:
             pass
             
+    # 步驟 2: 如果沒有上傳，嘗試讀取內建的 Base64 預設圖片
     if im is None:
-        # 直接讀取完整的 BOARD_B64
-        im = Image.open(io.BytesIO(base64.b64decode(BOARD_B64))).convert("RGB")
+        try:
+            img_data = base64.b64decode(BOARD_B64)
+            im = Image.open(io.BytesIO(img_data)).convert("RGB")
+        except Exception:
+            # 步驟 3: [終極防呆] 萬一圖片字串損毀，直接用程式畫一張空白底圖，保證 100% 不當機
+            im = Image.new("RGB", (1540, 317), (240, 240, 240))
+            d = ImageDraw.Draw(im)
+            d.rectangle([1540*0.233, 317*0.286, 1540*0.969, 317*0.528], fill=(255, 255, 255))
             
     W, H = im.size
-    fill = im.getpixel((int(W * 0.30), int(H * 0.64)))
+    
+    # 為了防止取 pixel 時超出範圍的錯誤保護
+    try: fill = im.getpixel((int(W * 0.30), int(H * 0.64)))
+    except Exception: fill = (255, 255, 255)
+        
     d = ImageDraw.Draw(im)
 
     def cell(x0, y0, x1, y1, text, size, left=False):
-        if not text:
-            return
+        if not text: return
         f = _font(size)
         bb = d.textbbox((0, 0), text, font=f)
         tw, th = bb[2] - bb[0], bb[3] - bb[1]
@@ -439,8 +420,7 @@ def make_header(hole, depth, date, project, board=None):
 
 def _text_img(text, size):
     fp = next((p for p in SERIF_PATHS if os.path.exists(p)), None)
-    if not fp:
-        return None
+    if not fp: return None
     f = _font(size)
     bb = ImageDraw.Draw(Image.new("RGB", (1, 1))).textbbox((0, 0), text, font=f)
     im = Image.new("RGB", (bb[2] - bb[0] + 20, bb[3] - bb[1] + 20), "white")
@@ -482,8 +462,7 @@ def build_pdf(boxes, hole, date, project, start_depth=0, rows_per_box=4,
             mx_, my_ = MARGIN
             for k in range(rows_per_box):
                 num = r0 + i * rows_per_box + k + 1
-                if total_rows and num > total_rows:
-                    break
+                if total_rows and num > total_rows: break
                 frac = my_ + (1 - 2 * my_) * (k + 0.5) / rows_per_box   
                 c.drawString(x0 + (HEADER_W + 0.3) * cm, y - BOX_H * frac * cm - 5.5, str(num))
             y -= h_cm * cm
@@ -554,8 +533,7 @@ def build_docx(boxes, hole, date, project, start_depth=0, rows_per_box=4,
         tbl._tbl.tblPr.append(lay)
         for j, wd in enumerate(widths):
             tbl.columns[j].width = wd
-            for c_ in tbl.columns[j].cells:
-                c_.width = wd
+            for c_ in tbl.columns[j].cells: c_.width = wd
         hrow = tbl.rows[0]
         hrow.height, hrow.height_rule = Cm(HEADER_H), WD_ROW_HEIGHT_RULE.EXACTLY
         hc = hrow.cells[0].merge(hrow.cells[1])
@@ -568,8 +546,7 @@ def build_docx(boxes, hole, date, project, start_depth=0, rows_per_box=4,
             row = tbl.rows[i + 1]
             h_cm = BOX_H * (im.height * FULL_ASPECT / im.width)
             row.height, row.height_rule = Cm(h_cm), WD_ROW_HEIGHT_RULE.EXACTLY
-            for j, wd in enumerate(widths):
-                row.cells[j].width = wd
+            for j, wd in enumerate(widths): row.cells[j].width = wd
             p = row.cells[0].paragraphs[0]
             tight(p)
             p.add_run().add_picture(_jpeg(im), width=Cm(BOX_W), height=Cm(h_cm - 0.05))
@@ -590,7 +567,6 @@ def build_docx(boxes, hole, date, project, start_depth=0, rows_per_box=4,
     doc.save(out)
     return out.getvalue()
 
-# 原封不動加回的 Base64 預設表頭照片
 BOARD_B64 = (
     "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAYEBAUEBAYFBQUGBgYHCQ4JCQgICRINDQoOFRIWFhUSFBQXGiEcFxgfGRQUHScdHyIj"
     "JSUlFhwpLCgkKyEkJST/2wBDAQYGBgkICREJCREkGBQYJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk"
