@@ -188,9 +188,12 @@ def _detect_holes(img, full_aspect=3.1):
     quad = _refine_quad(np.vstack([c.reshape(-1, 2) for c in grp]), quad)
     quad = order_pts(quad)
     quad = _extend_missing(quad, full_aspect)
+    
+    # 嚴格的幾何條件判斷 (避免不合理的扭曲被當作正常)
     area = cv2.contourArea(quad)
     bad = area < 0.05 * sh * sw
     bad = bad or bool(np.any(quad < 2) or np.any(quad[:, 0] > sw - 3) or np.any(quad[:, 1] > sh - 3))
+    
     return order_pts(quad / sc), bool(bad)
 
 
@@ -300,12 +303,6 @@ def detect_inner(img, full_aspect=3.1, inset_adj=0.0):
     if oq is None:
         return ph, True
         
-    ow = (np.linalg.norm(oq[1] - oq[0]) + np.linalg.norm(oq[2] - oq[3])) / 2
-    oh = (np.linalg.norm(oq[3] - oq[0]) + np.linalg.norm(oq[2] - oq[1])) / 2
-    inner_w, inner_h = cw * (1 - l - r), ch * (1 - t - b)
-    if not (1.0 < ow / inner_w < 1.25 and 1.0 < oh / inner_h < 1.45):
-        return ph, True
-        
     H = cv2.getPerspectiveTransform(oq, np.float32([[0, 0], [1, 0], [1, 1], [0, 1]]))
     fl, fr, ft, fb = TRAY_INSET
     
@@ -318,9 +315,38 @@ def detect_inner(img, full_aspect=3.1, inset_adj=0.0):
     p_w1 = cv2.perspectiveTransform(inn.reshape(-1, 1, 2), np.linalg.inv(H)).reshape(-1, 2)
     p = cv2.perspectiveTransform(p_w1.reshape(-1, 1, 2), np.linalg.inv(M1)).reshape(-1, 2)
     p = order_pts(p)
+    
+    # 【新增】嚴格幾何變形判斷：精準挑出 21-24m 等形狀錯誤的紅框
+    w1_len = np.linalg.norm(p[1] - p[0]) # 上緣寬
+    w2_len = np.linalg.norm(p[2] - p[3]) # 下緣寬
+    h1_len = np.linalg.norm(p[3] - p[0]) # 左緣高
+    h2_len = np.linalg.norm(p[2] - p[1]) # 右緣高
+    
+    avg_w = (w1_len + w2_len) / 2.0
+    avg_h = (h1_len + h2_len) / 2.0
+    
+    if avg_h == 0 or avg_w == 0:
+        bad = True
+    else:
+        # 1. 長寬比例是否太離譜 (正常約為 3.12 左右)
+        ratio = avg_w / avg_h
+        if ratio < 1.8 or ratio > 4.8:
+            bad = True
+        # 2. 上下/左右的長度落差是否太大 (梯形形變過大)
+        if abs(w1_len - w2_len) > avg_w * 0.15:
+            bad = True
+        if abs(h1_len - h2_len) > avg_h * 0.15:
+            bad = True
+        # 3. 對角線是否差不多長 (確保是矩形)
+        diag1 = np.linalg.norm(p[2] - p[0])
+        diag2 = np.linalg.norm(p[3] - p[1])
+        if abs(diag1 - diag2) > ((diag1 + diag2) / 2.0) * 0.15:
+            bad = True
+
     hh, ww = img.shape[:2]
     bad = bool(bad or np.any(p[:, 0] < 0) or np.any(p[:, 1] < 0)
                or np.any(p[:, 0] > ww - 1) or np.any(p[:, 1] > hh - 1))
+               
     return p, bad
 
 
@@ -345,22 +371,31 @@ def crop_partial(im, k, n=4, margin=MARGIN):
 
 
 def auto_detect_filled_rows(img, total_rows=4):
-    h, w = img.shape[:2]
-    small = cv2.resize(img, (max(1, w // 4), max(1, h // 4)))
-    sh, sw = small.shape[:2]
-    s_row_h = sh // total_rows
-    hsv = cv2.cvtColor(small, cv2.COLOR_RGB2HSV)
-    
-    filled_count = 0
-    for i in range(total_rows):
-        strip = hsv[i * s_row_h:(i + 1) * s_row_h, :]
-        blue_mask = cv2.inRange(strip, (85, 50, 50), (125, 255, 255))
-        blue_ratio = np.sum(blue_mask > 0) / (strip.shape[0] * strip.shape[1])
+    try:
+        h, w = img.shape[:2]
+        if h == 0 or w == 0: return int(total_rows)
+        small = cv2.resize(img, (max(1, w // 4), max(1, h // 4)))
+        sh, sw = small.shape[:2]
+        s_row_h = sh // total_rows
+        if s_row_h == 0: return int(total_rows)
         
-        if blue_ratio < 0.40:
-            filled_count = i + 1
+        hsv = cv2.cvtColor(small, cv2.COLOR_RGB2HSV)
+        filled_count = 0
+        for i in range(total_rows):
+            strip = hsv[i * s_row_h:(i + 1) * s_row_h, :]
+            area = strip.shape[0] * strip.shape[1]
+            if area == 0: continue
             
-    return max(1, filled_count)
+            blue_mask = cv2.inRange(strip, (85, 50, 50), (125, 255, 255))
+            blue_ratio = np.sum(blue_mask > 0) / area
+            
+            if blue_ratio < 0.40:
+                filled_count = i + 1
+                
+        return max(1, int(filled_count))
+    except Exception:
+        # 防呆：如果計算出錯，預設回傳滿箱列數
+        return int(total_rows)
 
 
 def draw_corners(img, pts, color=(255, 0, 0)):
@@ -384,7 +419,6 @@ def _font(size):
                     continue
     return ImageFont.load_default()
 
-# 已修正 EOF 崩潰漏洞：直接接收 bytes
 def make_header(hole, depth, date, project, board=None):
     if board is not None:
         im = Image.open(io.BytesIO(board)).convert("RGB")
@@ -436,7 +470,8 @@ def _jpeg(im, q=88):
 
 def _pages(boxes, rows_per_box, per_page, start_depth, row_m, total_rows=0):
     total_rows = total_rows or len(boxes) * rows_per_box
-    bpp = per_page // rows_per_box
+    bpp = int(per_page // rows_per_box)
+    if bpp == 0: bpp = 1  # 防呆避免除數問題
     for p in range(0, len(boxes), bpp):
         chunk = boxes[p:p + bpp]
         r0 = p * rows_per_box
