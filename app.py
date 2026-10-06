@@ -31,6 +31,8 @@ with st.sidebar:
     rows_per_box = st.number_input("每箱列數", 1, 10, 4)
     row_m = st.number_input("每列代表深度 (m)", 1, 5, 1)
     per_page = st.number_input("每頁箱號數", 4, 40, 20, 4)
+    last_rows = st.number_input("最後一箱實際有岩心的列數（0 = 滿箱）", 0, 10, 0,
+                                help="例：只鑽到 50m，最後一箱只有 49、50 兩列 → 填 2。照片仍保留整個箱子，箱號只標到 50。")
     end_mark = st.checkbox("最後加「鑽探結束」", True)
     skip_warp = st.checkbox("照片已是正的，不做透視校正", False)
 
@@ -141,7 +143,7 @@ with st.expander("角點不準？手動點選岩心槽四個內角"):
 
 # ---------------- 2. 輸出 ----------------
 st.subheader("2. 輸出成果（版面同範例 Word）")
-st.write(f"共 {len(files)} 張照片 → {len(files) * rows_per_box} 個箱號，"
+st.write(f"共 {len(files)} 張照片 → {((len(files) - 1) * rows_per_box + last_rows) if last_rows else len(files) * rows_per_box} 個箱號，"
          f"每頁 {per_page} 個箱號。")
 if st.button("產生 Word / PDF", type="primary"):
     boxes, bar = [], st.progress(0.0, "處理照片中…")
@@ -150,7 +152,8 @@ if st.button("產生 Word / PDF", type="primary"):
         bar.progress((i + 1) / len(files))
     kw = dict(hole=hole, date=date, project=project, start_depth=start_depth,
               rows_per_box=rows_per_box, per_page=per_page, row_m=row_m,
-              board=board_up if board_up else None, end_mark=end_mark)
+              board=board_up if board_up else None, end_mark=end_mark,
+              total_rows=((len(files) - 1) * rows_per_box + last_rows) if last_rows else 0)
     st.session_state["pdf"] = build_pdf(boxes, **kw)
     st.session_state["docx"] = build_docx(boxes, **kw)
     bar.empty()
