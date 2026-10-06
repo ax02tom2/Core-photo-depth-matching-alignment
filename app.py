@@ -13,7 +13,7 @@ import streamlit.components.v1 as components
 
 import core
 
-APP_VERSION = "2.9"
+APP_VERSION = "2.10"
 DETECTOR_VERSION = getattr(core, "DETECTOR_VERSION", "unknown")
 
 natural_key = core.natural_key
@@ -57,6 +57,13 @@ h1{color:var(--navy);letter-spacing:.02em;}
 .status-warn{border-left:5px solid #d97706;border-radius:10px;padding:8px 12px;background:#fff7ed;color:#9a3412;font-weight:700;}
 .status-bad{border-left:5px solid #b42318;border-radius:10px;padding:8px 12px;background:#fff0ee;color:#9f1d1a;font-weight:700;}
 .small-note{font-size:.82rem;color:#657789;}
+.nav-caption-row{display:grid;grid-template-columns:1fr 1fr 1fr;gap:.6rem;margin:2px 0 4px 0;color:#17324d;font-size:.86rem;font-weight:800;}
+.nav-caption-row div{min-height:1.1rem;}
+[data-testid="stHorizontalBlock"] [data-testid="stButton"] button,
+[data-testid="stHorizontalBlock"] [data-testid="stSelectbox"] [data-baseweb="select"] > div{min-height:46px;height:46px;box-sizing:border-box;border-radius:10px;}
+[data-testid="stHorizontalBlock"] [data-testid="stButton"] button{font-size:1rem;font-weight:800;padding:0 .8rem;}
+[data-testid="stHorizontalBlock"] [data-testid="stSelectbox"] [data-baseweb="select"] > div{display:flex;align-items:center;font-size:1rem;font-weight:800;border:2px solid #78a9cf;background:#f5fbff;color:#17324d;box-shadow:0 3px 10px rgba(11,111,179,.10);padding-top:0;padding-bottom:0;}
+[data-testid="stHorizontalBlock"] [data-testid="stSelectbox"] [data-baseweb="select"] > div:focus-within{border-color:#0b6fb3;box-shadow:0 0 0 3px rgba(11,111,179,.14);}
 button[kind="primary"]{min-height:46px;font-size:1.05rem;font-weight:800;box-shadow:0 5px 16px rgba(11,111,179,.18);}
 [data-testid="stMetric"]{background:rgba(255,255,255,.78);border:1px solid var(--line);border-radius:12px;padding:8px 10px;}
 </style>
@@ -112,14 +119,14 @@ if not files:
 files = sorted(files, key=lambda f: natural_key(f.name))
 for k in ("manual", "rot", "crop_cfg", "edit_nonce", "crop_nonce"):
     st.session_state.setdefault(k, {})
-st.session_state.setdefault("state_version", "2.8")
-if st.session_state.get("state_version") != "2.8":
+st.session_state.setdefault("state_version", "2.10")
+if st.session_state.get("state_version") != "2.10":
     st.session_state["manual"].clear()
     st.session_state["rot"].clear()
     st.session_state["crop_cfg"].clear()
     st.session_state["edit_nonce"].clear()
     st.session_state["crop_nonce"].clear()
-    st.session_state["state_version"] = "2.8"
+    st.session_state["state_version"] = "2.10"
 
 pdir = "ccw" if portrait_dir == "逆時針" else "cw"
 
@@ -325,10 +332,15 @@ def _step(d):
     st.session_state["sel_photo"] = names[max(0, min(len(names) - 1, k))]
 
 
-nb1, nb2, nb3 = st.columns([1, 1, 6])
-nb1.button("◀ 上一張", on_click=_step, args=(-1,))
-nb2.button("下一張 ▶", on_click=_step, args=(1,))
-sel_name = nb3.selectbox("選擇照片", names, key="sel_photo")
+# 照片切換：三個控制項做成同尺寸、同高度，避免「選擇照片」顯得太小。
+st.markdown('<div class="nav-caption-row"><div>照片切換</div><div></div><div>選擇照片</div></div>', unsafe_allow_html=True)
+nb1, nb2, nb3 = st.columns(3, gap="small")
+with nb1:
+    st.button("◀ 上一張", on_click=_step, args=(-1,), use_container_width=True)
+with nb2:
+    st.button("下一張 ▶", on_click=_step, args=(1,), use_container_width=True)
+with nb3:
+    sel_name = st.selectbox("選擇照片", names, key="sel_photo", label_visibility="collapsed")
 sel = next(f for f in out_files if f.name == sel_name)
 ck = (sel.name, cur_rot(sel.name))
 
