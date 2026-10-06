@@ -1,23 +1,88 @@
 <!doctype html>
-<html><head><meta charset="utf-8"><style>
-html,body{margin:0;padding:0;background:transparent;font-family:Arial,sans-serif}
-canvas{display:block;width:100%;height:auto;border-radius:6px;touch-action:none;cursor:default}
-.hint{font-size:12px;margin:6px 0 0;color:#666}
-</style></head><body>
-<canvas id="c"></canvas><div class="hint">拖曳黃色角點；放開後右側校正結果會更新。</div>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+html,body{margin:0;padding:0;background:transparent;font-family:Arial,sans-serif;overflow:hidden;width:100%}
+#wrap{width:100%;max-width:100%;overflow:hidden}
+canvas{display:block;width:100%;height:auto;max-width:100%;border-radius:6px;touch-action:none;cursor:default}
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
 <script>
 const canvas=document.getElementById('c'),ctx=canvas.getContext('2d');
 let args=null,points=[],img=new Image(),active=-1,changed=false,scale=1,dpr=Math.max(1,window.devicePixelRatio||1);
 function send(m){window.parent.postMessage(Object.assign({isStreamlitMessage:true},m),'*')}
 send({type:'streamlit:componentReady',apiVersion:1});
-function resizeFrame(){send({type:'streamlit:setFrameHeight',height:Math.ceil(canvas.getBoundingClientRect().height+32)})}
-function draw(){if(!args||!img.complete)return;const w=args.display_width,h=args.display_height;canvas.style.width=w+'px';canvas.style.height=h+'px';canvas.width=Math.round(w*dpr);canvas.height=Math.round(h*dpr);scale=w/args.image_width;ctx.setTransform(dpr,0,0,dpr,0,0);ctx.clearRect(0,0,w,h);ctx.drawImage(img,0,0,w,h);const p=points.map(q=>[q[0]*scale,q[1]*scale]);ctx.strokeStyle='red';ctx.lineWidth=3;ctx.beginPath();p.forEach((q,i)=>i?ctx.lineTo(q[0],q[1]):ctx.moveTo(q[0],q[1]));ctx.closePath();ctx.stroke();p.forEach((q,i)=>{ctx.fillStyle='yellow';ctx.strokeStyle='red';ctx.lineWidth=2;ctx.beginPath();ctx.arc(q[0],q[1],9,0,Math.PI*2);ctx.fill();ctx.stroke();ctx.fillStyle='#111';ctx.font='bold 12px Arial';ctx.fillText(String(i+1),q[0]-4,q[1]+4)});resizeFrame()}
+function availWidth(){
+  const a=document.documentElement.clientWidth||window.innerWidth||720;
+  return Math.max(280, Math.min(a-8, args&&args.image_width?args.image_width:720));
+}
+function resizeFrame(){
+  const w=availWidth();
+  const h=Math.ceil(w*(args&&args.image_height?args.image_height:1)/(args&&args.image_width?args.image_width:w)+12);
+  send({type:'streamlit:setFrameHeight',height:h});
+}
+function draw(){
+  if(!args||!img.complete)return;
+  const w=availWidth();
+  const h=Math.round(w*args.image_height/args.image_width);
+  canvas.style.width='100%';
+  canvas.style.height=h+'px';
+  canvas.width=Math.round(w*dpr);
+  canvas.height=Math.round(h*dpr);
+  scale=w/args.image_width;
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  ctx.clearRect(0,0,w,h);
+  ctx.drawImage(img,0,0,w,h);
+  const p=points.map(q=>[q[0]*scale,q[1]*scale]);
+  ctx.strokeStyle='red';ctx.lineWidth=3;ctx.beginPath();
+  p.forEach((q,i)=>i?ctx.lineTo(q[0],q[1]):ctx.moveTo(q[0],q[1]));
+  ctx.closePath();ctx.stroke();
+  p.forEach(q=>{
+    ctx.fillStyle='yellow';ctx.strokeStyle='red';ctx.lineWidth=2;
+    ctx.beginPath();ctx.arc(q[0],q[1],10,0,Math.PI*2);ctx.fill();ctx.stroke();
+  });
+  requestAnimationFrame(resizeFrame);
+}
 function pos(e){const r=canvas.getBoundingClientRect();return{x:e.clientX-r.left,y:e.clientY-r.top}}
-function near(x,y){let bi=-1,b=1e9;for(let i=0;i<points.length;i++){const px=points[i][0]*scale,py=points[i][1]*scale,d=Math.hypot(x-px,y-py);if(d<b){b=d;bi=i}}return b<=24?bi:-1}
-canvas.addEventListener('pointerdown',e=>{const p=pos(e);active=near(p.x,p.y);if(active>=0){changed=false;canvas.setPointerCapture(e.pointerId);canvas.style.cursor='grabbing';e.preventDefault()}});
-canvas.addEventListener('pointermove',e=>{if(active<0)return;const p=pos(e);points[active][0]=Math.max(0,Math.min(args.image_width-1,p.x/scale));points[active][1]=Math.max(0,Math.min(args.image_height-1,p.y/scale));changed=true;draw();e.preventDefault()});
-canvas.addEventListener('pointerup',e=>{if(active<0)return;if(changed)send({type:'streamlit:setComponentValue',value:JSON.stringify(points)});active=-1;canvas.style.cursor='default';e.preventDefault()});
+function near(x,y){
+  let bi=-1,b=1e9;
+  for(let i=0;i<points.length;i++){
+    const px=points[i][0]*scale,py=points[i][1]*scale,d=Math.hypot(x-px,y-py);
+    if(d<b){b=d;bi=i}
+  }
+  return b<=28?bi:-1;
+}
+canvas.addEventListener('pointerdown',e=>{
+  const p=pos(e);active=near(p.x,p.y);
+  if(active>=0){changed=false;canvas.setPointerCapture(e.pointerId);canvas.style.cursor='grabbing';e.preventDefault()}
+});
+canvas.addEventListener('pointermove',e=>{
+  if(active<0)return;
+  const p=pos(e);
+  points[active][0]=Math.max(0,Math.min(args.image_width-1,p.x/scale));
+  points[active][1]=Math.max(0,Math.min(args.image_height-1,p.y/scale));
+  changed=true;draw();e.preventDefault();
+});
+canvas.addEventListener('pointerup',e=>{
+  if(active<0)return;
+  if(changed)send({type:'streamlit:setComponentValue',value:JSON.stringify(points)});
+  active=-1;canvas.style.cursor='default';e.preventDefault();
+});
 canvas.addEventListener('pointercancel',()=>{active=-1;canvas.style.cursor='default'});
-window.addEventListener('message',e=>{const d=e.data||{};if(d.type!=='streamlit:render')return;args=d.args||{};points=(args.points||[]).map(q=>[Number(q[0]),Number(q[1])]);img=new Image();img.onload=draw;img.src=args.image});
+window.addEventListener('message',e=>{
+  const d=e.data||{};
+  if(d.type!=='streamlit:render')return;
+  args=d.args||{};
+  points=(args.points||[]).map(q=>[Number(q[0]),Number(q[1])]);
+  img=new Image();
+  img.onload=draw;
+  img.src=args.image;
+});
 window.addEventListener('load',resizeFrame);
-</script></body></html>
+window.addEventListener('resize',()=>{draw();resizeFrame()});
+</script>
+</body>
+</html>

@@ -13,7 +13,7 @@ import streamlit.components.v1 as components
 
 import core
 
-APP_VERSION = "2.7"
+APP_VERSION = "2.8"
 DETECTOR_VERSION = getattr(core, "DETECTOR_VERSION", "unknown")
 
 natural_key = core.natural_key
@@ -45,11 +45,10 @@ with st.sidebar:
     hole = st.text_input("孔號", "")
     date_value = st.date_input("日期", value=None, format="YYYY.MM.DD")
     date = date_value.strftime("%Y.%m.%d") if date_value else ""
-    start_depth = st.number_input("起始深度 (m)", 0, 500, 0)
+    start_depth = 0
     board_up = st.file_uploader(
         "自訂表頭告示牌照片（選填）", type=["jpg", "jpeg", "png"]
     )
-    st.caption("工程名稱、孔號、日期預設留白；日期可用日曆選取。")
 
     st.header("轉向 / 校正")
     portrait_dir = st.radio(
@@ -81,14 +80,14 @@ if not files:
 files = sorted(files, key=lambda f: natural_key(f.name))
 for k in ("manual", "rot", "crop_cfg", "edit_nonce", "crop_nonce"):
     st.session_state.setdefault(k, {})
-st.session_state.setdefault("state_version", "2.7")
-if st.session_state.get("state_version") != "2.7":
+st.session_state.setdefault("state_version", "2.8")
+if st.session_state.get("state_version") != "2.8":
     st.session_state["manual"].clear()
     st.session_state["rot"].clear()
     st.session_state["crop_cfg"].clear()
     st.session_state["edit_nonce"].clear()
     st.session_state["crop_nonce"].clear()
-    st.session_state["state_version"] = "2.7"
+    st.session_state["state_version"] = "2.8"
 
 pdir = "ccw" if portrait_dir == "逆時針" else "cw"
 
@@ -116,7 +115,7 @@ def _photo_cfg(name, rot):
     ck = (name, rot)
     cfg = st.session_state["crop_cfg"].setdefault(
         ck,
-        {"mgx": 0.004, "mgy": 0.006, "source_pad": 0.004},
+        {"mgx": 0.0, "mgy": 0.0, "source_pad": 0.0},
     )
     return cfg
 
@@ -305,7 +304,7 @@ ck = (sel.name, cur_rot(sel.name))
 cfg = _photo_cfg(sel.name, cur_rot(sel.name))
 with st.container(border=True):
     st.markdown("#### 本張調整")
-    q1, q2, q3 = st.columns(3)
+    q1, q2, q3, q4 = st.columns(4)
     with q1:
         cfg["mgx"] = st.slider(
             "左右留邊 %", 0.0, 3.0, float(cfg["mgx"] * 100), 0.1,
@@ -321,6 +320,14 @@ with st.container(border=True):
             "角點向外留邊 %", 0.0, 2.0, float(cfg["source_pad"] * 100), 0.1,
             key=f"pad_{sel.name}_{ck[1]}_{_nonce('crop_nonce', ck)}",
         ) / 100
+    with q4:
+        st.markdown("&nbsp;")
+        reset_crop = st.button("重設本張裁切留邊", key=f"reset_crop_{sel.name}_{ck[1]}_{_nonce('crop_nonce', ck)}")
+
+if reset_crop:
+    st.session_state["crop_cfg"].pop(ck, None)
+    _bump_nonce("crop_nonce", ck)
+    st.rerun()
 
 rot_val = st.selectbox(
     "此張額外旋轉（逆時針）", [0, 90, 180, 270],
@@ -364,17 +371,11 @@ with colB:
     else:
         st.info("沒有可用角點")
 
-with st.container(border=True):
-    b1, b2 = st.columns(2)
-    reset_auto = b1.button("恢復本張自動角點")
-    reset_crop = b2.button("重設本張裁切留邊")
+st.caption("拖曳黃色角點即可調整箱框；四個角點不需要依順序操作。")
+reset_auto = st.button("恢復本張自動角點", key=f"reset_auto_{sel.name}_{ck[1]}_{_nonce('edit_nonce', ck)}")
 if reset_auto:
     st.session_state["manual"].pop(ck, None)
     _bump_nonce("edit_nonce", ck)
-    st.rerun()
-if reset_crop:
-    st.session_state["crop_cfg"].pop(ck, None)
-    _bump_nonce("crop_nonce", ck)
     st.rerun()
 
 out_files = output_files_effective()
